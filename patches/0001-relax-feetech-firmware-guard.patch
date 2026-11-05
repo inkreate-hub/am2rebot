@@ -1,0 +1,32 @@
+diff --git a/src/lerobot/motors/feetech/feetech.py b/src/lerobot/motors/feetech/feetech.py
+index 353148b5..5a4bc601 100644
+--- a/src/lerobot/motors/feetech/feetech.py
++++ b/src/lerobot/motors/feetech/feetech.py
+@@ -143,12 +143,24 @@ class FeetechMotorsBus(SerialMotorsBus):
+             )
+ 
+     def _assert_same_firmware(self) -> None:
++        # LOCAL PATCH (not upstream): downgraded from RuntimeError to a warning.
++        #
++        # The AM-ARM200 leader on this machine shipped with mixed STS3215
++        # firmware (ids 1,5,6,7 = 3.9; ids 2,3,4 = 3.10). The only
++        # firmware-gated entry in the Feetech control tables is "Hts"
++        # (tables.py:97, valid for firmware >= 2.54) and both versions clear
++        # that, so every register this driver touches is identical across the
++        # bus. Upstream guards the general case rather than validating each
++        # combination.
++        #
++        # Revert with: git checkout -- src/lerobot/motors/feetech/feetech.py
+         firmware_versions = self._read_firmware_version(self.ids, raise_on_error=True)
+         if len(set(firmware_versions.values())) != 1:
+-            raise RuntimeError(
+-                "Some Motors use different firmware versions:"
++            logger.warning(
++                "Some motors use different firmware versions:"
+                 f"\n{pformat(firmware_versions)}\n"
+-                "Update their firmware first using Feetech's software. "
++                "Proceeding anyway (local patch). If a joint reads offset, inverted, or jumps "
++                "during calibration, flash them to a common version with Feetech's software first. "
+                 "Visit https://www.feetechrc.com/software."
+             )
+ 

@@ -1,0 +1,8 @@
+# Upstream clone of liyiteng/lerobot_alohamini — 157 MB plus a 7.7 GB .venv.
+# Not vendored here. setup.sh re-clones it; patches/ carries our one local change.
+lerobot_alohamini/
+
+__pycache__/
+*.py[cod]
+.venv/
+*.log
