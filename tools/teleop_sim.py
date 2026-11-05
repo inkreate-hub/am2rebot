@@ -256,6 +256,7 @@ def main() -> int:
             look_at_arm(viewer.cam, arm.model)
 
         n = 0
+        last_word, last_print = "", 0.0
         while not session.quit and time.perf_counter() < deadline:
             if viewer is not None and not viewer.is_running():
                 break
@@ -263,7 +264,12 @@ def main() -> int:
             if viewer is not None:
                 viewer.sync()
             n += 1
-            if n % 10 == 0 and sys.stdout.isatty():
+            # Only redraw when the state word changes or twice a second.
+            # Printing a growing "STALE 230000 ms" line at loop rate turns a
+            # recoverable dropout into pages of scrollback.
+            now = time.perf_counter()
+            word = status.split()[0]
+            if sys.stdout.isatty() and (word != last_word or now - last_print > 0.5):
                 lead = reader.last_good
                 cells = (
                     "  ".join(
@@ -272,7 +278,9 @@ def main() -> int:
                     if lead
                     else "no leader data"
                 )
-                print(f"\r{status:<22} {cells}", end="", flush=True)
+                end = "\n" if word != last_word else ""
+                print(f"\r{status:<34} {cells}", end=end, flush=True)
+                last_word, last_print = word, now
             time.sleep(period)
     except KeyboardInterrupt:
         print("\ninterrupted")

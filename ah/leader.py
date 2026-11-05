@@ -23,6 +23,7 @@ import logging
 import statistics
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class ReaderStats:
 
     reads_ok: int = 0
     reads_failed: int = 0
+    reconnects: int = 0
     intervals_ms: list[float] = field(default_factory=list)
     read_ms: list[float] = field(default_factory=list)
     #: Per-joint absolute change between consecutive samples, degrees.
@@ -74,7 +76,8 @@ class ReaderStats:
         iv = self.intervals_ms
         rd = self.read_ms
         lines = [
-            f"reads: {self.reads_ok} ok, {self.reads_failed} failed",
+            f"reads: {self.reads_ok} ok, {self.reads_failed} failed, "
+            f"{self.reconnects} reconnect attempts",
             f"interval: mean {statistics.fmean(iv):.1f} ms, "
             f"sd {statistics.pstdev(iv):.1f}, max {max(iv):.1f}  "
             f"-> {1000 / statistics.fmean(iv):.1f} Hz",
@@ -106,6 +109,12 @@ class AMLeaderReader:
             hiccup, short enough that a dead leader is caught quickly.
         track_jitter: Collect per-sample statistics. Small cost, and it is the
             evidence for "log input jitter".
+        reconnect_after_failures: Consecutive failed reads before trying to
+            reopen the port. This adapter dies permanently on a USB
+            re-enumeration -- one `errno 5` then `Port is in use!` forever --
+            so reopening is the only recovery.
+        reconnect_interval_s: Minimum gap between reconnect attempts. Reopening
+            a serial port is not free; retrying at loop rate stalls the loop.
 
     Example:
         >>> reader = AMLeaderReader(port="/dev/ttyACM0", leader_id="am_leader")
@@ -123,13 +132,18 @@ class AMLeaderReader:
         arm_profile: str = "am-leader-6dof",
         stale_after_s: float = 0.25,
         track_jitter: bool = True,
+        reconnect_after_failures: int = 5,
+        reconnect_interval_s: float = 2.0,
     ) -> None:
         self.port = port
         self.leader_id = leader_id
         self.arm_profile = arm_profile
         self.stale_after_s = stale_after_s
         self.track_jitter = track_jitter
+        self.reconnect_after_failures = reconnect_after_failures
+        self.reconnect_interval_s = reconnect_interval_s
 
+        self._last_reconnect_t = 0.0
         self._leader = None
         self._connected = False
         self._last_good: LeaderSample | None = None
@@ -215,6 +229,65 @@ class AMLeaderReader:
         """Failed reads since the last good one. Non-zero means trouble."""
         return self._consecutive_failures
 
+    # ------------------------------------------------------------- reconnection
+
+    def _maybe_reconnect(self) -> None:
+        """Try to reopen the bus after repeated failures, with backoff.
+
+        Necessary because of how this adapter fails. A USB re-enumeration gives
+        one `errno 5, Input/output error` and from then on every read returns
+        `Port is in use!` -- the file handle is dead and no amount of retrying
+        at that handle will recover. Only closing and reopening does.
+
+        Observed on this machine: `/dev/ttyACM0` disappearing mid-session, and
+        reappearing (sometimes under a different number) after a replug.
+
+        Backoff matters: reopening a serial port is not free, and hammering it
+        at 30 Hz turns a recoverable blip into a stalled control loop.
+        """
+        if self._consecutive_failures < self.reconnect_after_failures:
+            return
+        now = time.monotonic()
+        if now - self._last_reconnect_t < self.reconnect_interval_s:
+            return
+        self._last_reconnect_t = now
+
+        self.stats.reconnects += 1
+        try:
+            self.disconnect()
+        except Exception:  # noqa: BLE001 - the handle is already broken
+            pass
+        self._connected = False
+
+        # The device may come back under a different number. Observed on this
+        # machine: /dev/ttyACM0 vanished entirely and returned after a replug.
+        # Calibration is keyed by --leader-id, not by port, so moving to
+        # ttyACM1 costs nothing as long as we actually look for it.
+        candidates = [self.port] if Path(self.port).exists() else []
+        candidates += [
+            str(p) for p in sorted(Path("/dev").glob("ttyACM*")) if str(p) != self.port
+        ]
+        if not candidates:
+            logger.warning(
+                "no /dev/ttyACM* present (attempt %d) -- replug the adapter",
+                self.stats.reconnects,
+            )
+            return
+
+        for candidate in candidates:
+            try:
+                self.port = candidate
+                self.connect()
+            except Exception as exc:  # noqa: BLE001 - try the next candidate
+                logger.debug("reconnect to %s failed: %s", candidate, exc)
+                continue
+            logger.warning("reconnected on %s", candidate)
+            self._consecutive_failures = 0
+            return
+        logger.warning(
+            "reconnect attempt %d failed on %s", self.stats.reconnects, candidates
+        )
+
     # -------------------------------------------------------------------- read
 
     def read(self) -> LeaderSample | None:
@@ -241,6 +314,7 @@ class AMLeaderReader:
                     self._consecutive_failures,
                     exc,
                 )
+            self._maybe_reconnect()
             return None
 
         read_ms = (time.perf_counter() - t0) * 1e3
