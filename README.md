@@ -43,6 +43,7 @@ Then read [RUNBOOK.md](RUNBOOK.md) — it is the actual working document. Start 
 | `calibrate_leader.py` | The calibration sweep. **Writes EEPROM** |
 | `find_leader_ranges.py` | Leader-only joint-range sweep. Read-only |
 | `am2rebot_mapping.py` | Leader→B601 joint mapping, with a preview mode |
+| `teleop_am_to_b601.py` | The cross-vendor teleop loop. Has `--dry-run` and per-joint modes |
 | `tools/` | Read-only probes used during bring-up |
 | `lerobot_alohamini/` | Upstream clone — **gitignored**, not vendored |
 
