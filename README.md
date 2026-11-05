@@ -19,7 +19,7 @@ meant to be consumed directly by downstream work.
 | 7 Feetech servos detected, mapped to correct joint/gripper | ✅ ids 1–7, all model 777, 60/60 reply rate |
 | Calibration repeatable and reusable after reconnect/restart | ✅ verified across a power cycle, [RUNBOOK §2](RUNBOOK.md) |
 | Live timestamped values, 6 joints + gripper, no ROS 2 | ✅ `read_joints.py`, 98.8 Hz measured |
-| One joint moves → its reading changes; sign/order documented | 🟡 order ✅ documented; **signs pending** `characterize_joints.py --signs` |
+| One joint moves → its reading changes; sign/order documented | ✅ both measured, see [Sign convention](#sign-convention) |
 | 1°/2°/5° detectable; noise and backlash noted | 🟡 noise ✅ measured; **backlash pending** |
 | Demo video | ⬜ to record |
 | README: assembly, deps, connection, calibration, run, troubleshooting | ✅ this file |
@@ -208,11 +208,38 @@ Fixed, and matches servo ids 1–7. Downstream code can rely on it.
 shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_yaw, wrist_roll, gripper
 ```
 
+## Sign convention
+
+Measured 2026-11-05 with `characterize_joints.py --signs`. **Not** derivable
+from the servo tables or the calibration — it depends on how this arm was
+assembled and which way each servo horn was seated.
+
+| id | joint | value increases when… |
+|---|---|---|
+| 1 | shoulder_pan | base rotates **clockwise** seen from above |
+| 2 | shoulder_lift | upper arm **lifts** up, away from the table |
+| 3 | elbow_flex | elbow **flexes closed**, forearm folding in |
+| 4 | wrist_flex | wrist pitches **down** |
+| 5 | wrist_yaw | wrist yaws **clockwise** seen from above |
+| 6 | wrist_roll | gripper rolls **counter-clockwise** seen from behind the wrist |
+| 7 | gripper | jaw **opens** (0 = closed, 100 = open, normalised) |
+
+Six of the seven run *opposite* to the intuitive direction — only
+`shoulder_lift` increases when you lift the arm. Don't guess these; print them:
+
+```bash
+./lerobot_alohamini/.venv/bin/python read_joints.py --signs
+```
+
+That also prints the raw observations behind the table, so the conclusions can
+be audited rather than taken on trust.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| No `/dev/ttyACM*` | `brltty` grabs WCH `1a86` chips | `sudo apt remove brltty` |
+| `/dev/ttyACM0` vanishes mid-session, `FileNotFoundError` / `could not open port` | USB re-enumeration — the Waveshare adapter dropped off the bus. `lsusb` shows no `1a86` device at all | unplug and replug the USB cable; the port comes back. Calibration is keyed by `--id`, not port, so nothing is lost even if it returns as `ttyACM1` |
+| No `/dev/ttyACM*` ever appears | `brltty` grabs WCH `1a86` chips | `sudo apt remove brltty` (it is installed but inactive here, so this has not bitten yet) |
 | `Permission denied` on the port | not in `dialout` | `sudo usermod -aG dialout $USER`, log out/in |
 | Fewer than 7 servos found | two servos share an id and collide | `check_leader_standalone.py` to scan; re-flash with `set_one_id.py`, one servo on the bus |
 | Whole bus looks dead | header read byte-at-a-time overruns the `cdc_acm` latency | read the frame in one bulk call — already handled in `check_leader_standalone.py` |

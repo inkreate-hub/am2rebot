@@ -67,18 +67,32 @@ JOINT_ORDER = [
 # derivable from the servo tables or the calibration -- it depends on how this
 # particular arm was assembled and which way each servo horn was seated.
 #
-# Entries below are the recorded results. "unverified" means exactly that.
+# MEASURED 2026-11-05 on this arm, id=am_leader. Stated as the direction that
+# makes the value INCREASE, since that is what downstream code reasons about.
+#
+# Six of the seven run opposite to the intuitive direction -- only
+# shoulder_lift increases when you lift the arm. Do not guess these.
 SIGNS = {
-    "shoulder_pan": "unverified",
-    "shoulder_lift": "unverified",
-    "elbow_flex": "unverified",
-    "wrist_flex": "unverified",
-    "wrist_yaw": "unverified",
-    "wrist_roll": "unverified",
-    # This one IS known: it comes from the profile, not from assembly.
-    # MotorNormMode.RANGE_0_100 on id 7, and the measured sweep ran 0.1 -> 99.0
-    # with the jaw starting closed.
+    "shoulder_pan": "positive = base rotates CLOCKWISE seen from above",
+    "shoulder_lift": "positive = upper arm LIFTS up, away from the table",
+    "elbow_flex": "positive = elbow FLEXES closed (forearm folds in)",
+    "wrist_flex": "positive = wrist pitches DOWN",
+    "wrist_yaw": "positive = wrist yaws CLOCKWISE seen from above",
+    "wrist_roll": "positive = gripper rolls COUNTER-CLOCKWISE seen from behind the wrist",
+    # This one comes from the profile, not from assembly: MotorNormMode
+    # RANGE_0_100 on id 7, and the measured sweep ran 0.1 -> 99.0 opening.
     "gripper": "0 = closed, 100 = open (normalised, not degrees)",
+}
+
+# The raw observations, kept so the conclusions above can be audited.
+# Each is the motion that was asked for, and what the value did.
+SIGNS_RAW = {
+    "shoulder_pan": "decreases when base rotates counter-clockwise (from above)",
+    "shoulder_lift": "increases when the upper arm lifts away from the table",
+    "elbow_flex": "decreases when the forearm extends straight",
+    "wrist_flex": "decreases when the wrist pitches up",
+    "wrist_yaw": "decreases when the wrist yaws counter-clockwise (from above)",
+    "wrist_roll": "decreases when the gripper rolls clockwise (from behind)",
 }
 
 
@@ -107,6 +121,10 @@ def main() -> int:
         if any(v == "unverified" for v in SIGNS.values()):
             print("\nSome signs are unverified. Record them with:")
             print("  python characterize_joints.py --signs")
+        else:
+            print("\nMeasured 2026-11-05. Raw observations behind these:\n")
+            for name, obs in SIGNS_RAW.items():
+                print(f"  {name:<15} {obs}")
         return 0
 
     # Imported here so --signs and --help work without the venv's lerobot.
