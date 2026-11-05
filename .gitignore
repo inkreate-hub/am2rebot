@@ -9,4 +9,4 @@ __pycache__/
 
 # Subtask 2: vendored MuJoCo model, fetched by setup.sh (no LICENSE upstream)
 vendor/
-reports/*.png
+reports/sweep-*.png

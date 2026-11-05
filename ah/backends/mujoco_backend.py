@@ -116,6 +116,11 @@ class MuJoCoBackend(AHArm):
             loop.
         armature: Reflected rotor inertia per arm DoF, kg*m^2. See `ARMATURE` --
             the MJCF omits it and the wrist joints chatter without it.
+        offscreen_size: `(width, height)` of the offscreen framebuffer, for
+            `mujoco.Renderer`. The MJCF declares none, so the 640x480 default
+            otherwise caps rendered frames.
+        scenery: Add non-colliding lights and a floor so renders are legible.
+            Off by default -- headless physics does not need it.
 
     Example:
         >>> from ah.backends import MuJoCoBackend
@@ -139,6 +144,8 @@ class MuJoCoBackend(AHArm):
         max_joint_vel: float = 2.0,
         substeps_per_command: int = 15,
         armature: float = ARMATURE,
+        offscreen_size: tuple[int, int] = (1280, 960),
+        scenery: bool = False,
     ) -> None:
         super().__init__(limits)
         self.model_path = str(model_path or MODEL_PATH)
@@ -149,6 +156,8 @@ class MuJoCoBackend(AHArm):
         self.max_joint_vel = max_joint_vel
         self.substeps_per_command = substeps_per_command
         self.armature = armature
+        self.offscreen_size = offscreen_size
+        self.scenery = scenery
 
         self.model: mujoco.MjModel | None = None
         self.data: mujoco.MjData | None = None
@@ -168,6 +177,18 @@ class MuJoCoBackend(AHArm):
             exclude = spec.add_exclude()
             exclude.bodyname1 = body1
             exclude.bodyname2 = body2
+
+        # Offscreen framebuffer for mujoco.Renderer. rs_arm.xml declares no
+        # <visual><global offwidth>, so the default 640x480 caps any render and
+        # raises rather than downscaling. Must be set on the spec: mutating
+        # model.vis.global_ after compile leaves the EGL context inconsistent
+        # and the renderer dies with an unprintable EGLError.
+        spec.visual.global_.offwidth = self.offscreen_size[0]
+        spec.visual.global_.offheight = self.offscreen_size[1]
+
+        if self.scenery:
+            self._add_scenery(spec)
+
         self.model = spec.compile()
 
         # implicitfast integrates joint damping implicitly, which is the right
@@ -202,6 +223,38 @@ class MuJoCoBackend(AHArm):
         mujoco.mj_resetData(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
         self._sim_time = 0.0
+
+    @staticmethod
+    def _add_scenery(spec: mujoco.MjSpec) -> None:
+        """Add lights and a ground plane -- purely so renders are legible.
+
+        `rs_arm.xml` is an arm, not a scene: it carries no light and no floor,
+        so rendered straight it is a dim object floating in black. Seeed's own
+        scene files supply these.
+
+        The floor is given `contype=0 conaffinity=0`, i.e. visual only. A
+        colliding floor would change the physics, and the arm's base already
+        sits at the origin where a plane would intersect it.
+        """
+        spec.worldbody.add_light(
+            pos=[0.6, -0.6, 1.4], dir=[-0.4, 0.4, -1.0],
+            type=mujoco.mjtLightType.mjLIGHT_SPOT, cutoff=60.0, exponent=8.0,
+            diffuse=[0.8, 0.8, 0.8], specular=[0.25, 0.25, 0.25], castshadow=1,
+        )
+        spec.worldbody.add_light(
+            pos=[-0.8, 0.5, 1.0], dir=[0.5, -0.3, -1.0],
+            type=mujoco.mjtLightType.mjLIGHT_SPOT, cutoff=70.0, exponent=4.0,
+            diffuse=[0.4, 0.4, 0.45], castshadow=0,
+        )
+        spec.worldbody.add_geom(
+            name="ah_visual_floor",
+            type=mujoco.mjtGeom.mjGEOM_PLANE,
+            size=[1.2, 1.2, 0.02],
+            pos=[0.0, 0.0, 0.0],
+            rgba=[0.26, 0.28, 0.31, 1.0],
+            contype=0,
+            conaffinity=0,
+        )
 
     def _close(self) -> None:
         self.model = None
