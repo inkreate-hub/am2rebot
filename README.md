@@ -254,7 +254,8 @@ be audited rather than taken on trust.
 | Path | What | Writes? |
 |---|---|---|
 | **`read_joints.py`** | **The deliverable.** Live/CSV timestamped reader | no |
-| `characterize_joints.py` | Noise floor, signs, 1/2/5° steps, backlash | no |
+| `characterize_joints.py` | Noise floor, signs, hand-moved steps, backlash | no |
+| `measure_steps.py` | **Driven** 1/2/5° step response. Needs an external servo supply | **RAM only** |
 | `find_leader_ranges.py` | Per-joint travel sweep | no |
 | `calib_check.py` | Is the calibration still valid? | no |
 | `check_leader_standalone.py` | Bus scan, pyserial only, no lerobot needed | no |
