@@ -15,12 +15,12 @@ meant to be consumed directly by downstream work.
 
 | Criterion | State |
 |---|---|
-| Assembled, mounted, freely movable, no interference | see [Assembly](#assembly) |
+| Assembled, mounted, freely movable, no interference | ⚠️ `shoulder_pan` and `wrist_yaw` bind under drive — [check by hand](RUNBOOK.md) |
 | 7 Feetech servos detected, mapped to correct joint/gripper | ✅ ids 1–7, all model 777, 60/60 reply rate |
 | Calibration repeatable and reusable after reconnect/restart | ✅ verified across a power cycle, [RUNBOOK §2](RUNBOOK.md) |
 | Live timestamped values, 6 joints + gripper, no ROS 2 | ✅ `read_joints.py`, 98.8 Hz measured |
 | One joint moves → its reading changes; sign/order documented | ✅ both measured, see [Sign convention](#sign-convention) |
-| 1°/2°/5° detectable; noise and backlash noted | 🟡 noise ✅ measured; **backlash pending** |
+| 1°/2°/5° detectable; noise and backlash noted | ✅ all detectable by the sensor; backlash **0.79°** measured |
 | Demo video | ⬜ to record |
 | README: assembly, deps, connection, calibration, run, troubleshooting | ✅ this file |
 
@@ -177,10 +177,22 @@ Full report: [reports/noise-floor.md](reports/noise-floor.md).
 
 The sensor is **quantisation-limited, not noise-limited** — so 1° (11.4 ticks)
 carries roughly 11× margin over the smallest resolvable step, and 2°/5° are
-trivial. The practical limit on this arm is therefore **mechanical backlash in
-the gearbox and printed linkage, not the encoder.** Measure it with
-`characterize_joints.py --backlash` and quote that number; do not infer
-sub-degree repeatability from the noise figures above.
+trivial.
+
+The practical limit is **mechanical backlash, not the encoder** — measured at
+**0.791° (9.0 ticks)** on `wrist_flex`, confirmed by two independent methods.
+Quote that as the repeatability figure, **not** the 0.000° noise floor.
+
+Keep two questions apart:
+
+| | |
+|---|---|
+| Can the sensor **resolve** 1°? | ✅ yes — 11.4 ticks vs 0-tick noise |
+| Can the actuator **deliver** 1°? | ❌ no — backlash 0.79° eats the step |
+
+Only the first matters for a leader arm: the human supplies the motion. Once
+past the slack, repeatability is **0.04°**, about half a tick. Full numbers in
+[RUNBOOK.md](RUNBOOK.md).
 
 ## Measured joint ranges
 
@@ -256,6 +268,7 @@ be audited rather than taken on trust.
 | **`read_joints.py`** | **The deliverable.** Live/CSV timestamped reader | no |
 | `characterize_joints.py` | Noise floor, signs, hand-moved steps, backlash | no |
 | `measure_steps.py` | **Driven** 1/2/5° step response. Needs an external servo supply | **RAM only** |
+| `nudge.py` | Move one joint a little, logging load/voltage/current. Diagnostic | **RAM only** |
 | `find_leader_ranges.py` | Per-joint travel sweep | no |
 | `calib_check.py` | Is the calibration still valid? | no |
 | `check_leader_standalone.py` | Bus scan, pyserial only, no lerobot needed | no |

@@ -60,6 +60,80 @@ exist in the file but are not wired in — switch the loop to argmax-with-domina
 against per-joint floors. Mapping on this arm is already verified, so this only
 matters if you rebuild.
 
+## ⚠️ Two joints bind: `shoulder_pan` and `wrist_yaw`
+
+Established 2026-11-05 with `nudge.py`, which commands a small move while
+logging load, voltage, current and status. The arm drives fine — but not on
+every joint.
+
+**`wrist_flex` (id 4) drives correctly**, tracking 2° steps to within 0.6°, at
+**2–6% load**:
+
+| target | actual | load |
+|---|---|---|
+| 81.69 | 81.45 | -24 |
+| 85.69 | 85.49 | -24 |
+| 89.69 | 89.10 | -56 |
+
+**`shoulder_pan` (id 1) does not move at all** — and it is the *easiest* joint
+on the arm, vertical axis with no gravity load and ~115° of headroom each way:
+
+| commanded | actual | load | volts |
+|---|---|---|---|
+| -10.48 | -12.48 | -100 | 11.6 |
+| -6.48 | -12.48 | -284 | 11.6 |
+| -2.48 | -12.48 | **-464** | 11.6 |
+
+46% commanded torque, zero motion, supply rock-steady at 11.6 V with no sag.
+`wrist_yaw` behaves the same way and trips overload protection — a position
+error it can never close.
+
+So: not a supply problem, not a dead drive path, not a misconfigured servo
+(`Overload_Torque`, `Protection_Time` and `Torque_Limit` are identical between
+a working and a stuck joint). **Those two joints have genuine mechanical
+resistance.** Worth checking for a snagged cable, overtightened fastener or a
+printed part rubbing.
+
+I initially concluded from `shoulder_pan` alone that the whole arm had no drive
+authority. That was wrong — `wrist_flex` disproved it. Don't generalise from
+one joint on this arm.
+
+Nothing is damaged: every joint reports `Status=0` and 26–32 °C.
+
+**Consequences:**
+
+- The deliverable is unaffected either way. A leader is backdriven by hand and
+  only its encoders are read, which is why `read_joints.py` sustains 98.8 Hz.
+- Criterion 1 ("freely movable, no mechanical interference or excessive
+  friction") needs those two joints checked by hand before sign-off.
+
+## Measured step response and backlash (`wrist_flex`, driven)
+
+`measure_steps.py --joint wrist_flex`, 5 reps per step:
+
+| step | achieved | error | stddev |
+|---|---|---|---|
+| 1° | 0.369° | -0.631 | 0.294 |
+| 2° | 1.160° | -0.840 | 0.039 |
+| 5° | 4.097° | -0.903 | 0.048 |
+| **backlash** | | | **0.791° (9.0 ticks)** |
+
+Every step lands ~0.85° short, and backlash is 0.79° — the slack eats the move.
+Confirmed independently: the `nudge.py` run gives 0.79/0.79/0.80° from the
+same-target up-versus-down readings.
+
+**Separate the two questions**, because the criteria only ask the first:
+
+- **Can the sensor resolve 1°?** Yes, decisively. 1° = 11.4 ticks against a
+  measured 0-tick noise floor. 2° and 5° are trivial.
+- **Can the actuator deliver 1°?** No — backlash is 0.79°, comparable to the
+  step itself. Irrelevant for a leader arm, where the human provides motion.
+
+Once past the slack, repeatability is **0.04°** — about half an encoder tick.
+
+Quote **0.79° backlash** as the real repeatability figure, not the 0.000° noise
+floor.
+
 ## Machine constraints found
 
 | Item | Value | Consequence |
