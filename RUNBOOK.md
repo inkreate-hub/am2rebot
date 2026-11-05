@@ -241,12 +241,60 @@ drive the follower key-for-key."* Without that mapping:
 Per-joint direction may also be inverted; the B601's own leader needs
 `{"shoulder_pan":-1,"shoulder_lift":-1,"elbow_flex":1,"wrist_flex":1,"wrist_yaw":1,"wrist_roll":-1,"gripper":-6}`.
 
-### Fix: a ~60-line shim teleoperator
+### Measured leader ranges (2026-11-05, `id=am_leader`)
 
-Wrap `SOLeader` with the `joint_ranges` / `joint_directions` mapping that
-`rebot_102_leader.get_action()` already implements (`rebot_102_leader.py:180-194`),
-and register it as a new type. The AM-ARM200's small 1:1 joint sweep then maps
-onto the B601's much larger 767 mm envelope.
+From `find_leader_ranges.py`. Every joint near-symmetric about zero, which is
+what a correct calibration produces — **this is a healthy arm, not a fault.**
+
+| joint | min | max | span |
+|---|---|---|---|
+| shoulder_pan | -118.1 | 119.7 | 237.8 |
+| shoulder_lift | -102.6 | 103.6 | 206.2 |
+| elbow_flex | -92.3 | 92.9 | 185.1 |
+| wrist_flex | -92.4 | 92.5 | 185.0 |
+| wrist_yaw | -78.5 | 80.0 | 158.5 |
+| wrist_roll | -170.1 | 172.3 | 342.3 |
+| gripper | 0.1 | 99.0 | 98.9 |
+
+`wrist_roll` spans ~342° because it is the `full_turn_motor` — expected.
+`gripper` is a normalised 0–100 scale, not degrees.
+
+Note `lerobot-find-joint-limits` is **not** the tool for this — it demands a
+connected follower *and* a URDF because it measures end-effector workspace
+bounds. `find_leader_ranges.py` does the leader-only sweep instead, read-only.
+
+### Fix: the mapping, in `am2rebot_mapping.py`
+
+The mismatch turned out to be mostly an **offset, not a stretch**. The leader
+zeroes at mid-travel; the B601 zeroes at its sit-down pose and unfolds one way
+only, hence its negative-only `(-200, 1)` limits. Shift by −100° and the two
+arms line up at true 1:1 degrees:
+
+| joint | direction | scale | offset | result | clipped |
+|---|---|---|---|---|---|
+| shoulder_pan | +1 | 1.0 | 0 | -118.1 … 119.7 | 0% |
+| shoulder_lift | +1 | 1.0 | **-100** | -202.6 … 3.6 | 2.5% |
+| elbow_flex | +1 | 1.0 | **-100** | -192.3 … -7.1 | 0% |
+| wrist_flex | +1 | 0.86 | 0 | -79.5 … 79.5 | 0% |
+| wrist_yaw | +1 | 1.0 | 0 | -78.5 … 80.0 | 0% |
+| wrist_roll | +1 | **0.5** | 0 | -85.0 … 86.2 | 0% |
+| gripper | **-1** | **2.727** | 0 | -270.0 … -0.3 | 0% |
+
+2.5% lost on one joint, at the far extreme of `shoulder_lift` travel. Preview it
+any time:
+```bash
+./lerobot_alohamini/.venv/bin/python am2rebot_mapping.py
+```
+
+1:1 was chosen over a full-span stretch deliberately — stretching would use more
+of the B601's 767 mm envelope but makes teleop feel amplified. Degrees-to-degrees
+means the follower mirrors your hand.
+
+⚠️ **Directions are unverified.** Sign is the one thing range data cannot
+reveal — a joint reading +90 on the leader may need -90 on the follower
+depending on assembly. Check each joint on hardware at low speed before
+trusting the table. The gripper also assumes **leader 0 == closed**; if it opens
+backwards, flip to `direction=1, offset=-270`.
 
 ### Safety before the first cross-vendor run
 

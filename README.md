@@ -15,7 +15,7 @@ patch upstream needs, and the hard-won notes in [RUNBOOK.md](RUNBOOK.md).
 |---|---|
 | AM-ARM200 leader | ✅ assembled, ids flashed, calibrated, calibration survives power-cycle |
 | reBot B601 follower | ⬜ not connected yet |
-| Cross-vendor mapping shim | ⬜ not written — the pair will connect but not track, see RUNBOOK §gap |
+| Cross-vendor mapping | 🟡 computed from measured ranges in `am2rebot_mapping.py` — directions still need hardware verification |
 
 ## Get going
 
@@ -41,6 +41,8 @@ Then read [RUNBOOK.md](RUNBOOK.md) — it is the actual working document. Start 
 | `verify_mapping.py` | Which id is which joint. ⚠️ false-positives, see RUNBOOK |
 | `set_one_id.py` | Flash one servo id. **Writes EEPROM** |
 | `calibrate_leader.py` | The calibration sweep. **Writes EEPROM** |
+| `find_leader_ranges.py` | Leader-only joint-range sweep. Read-only |
+| `am2rebot_mapping.py` | Leader→B601 joint mapping, with a preview mode |
 | `tools/` | Read-only probes used during bring-up |
 | `lerobot_alohamini/` | Upstream clone — **gitignored**, not vendored |
 
