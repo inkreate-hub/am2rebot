@@ -16,6 +16,7 @@ row which moves is the row you expect.
 
 import argparse
 import sys
+import termios
 import time
 
 import serial
@@ -103,19 +104,32 @@ def read_u16(ser, motor_id, addr):
 def scan(port):
     print(f"== Scanning {port} ==")
     hits = {}
+    opened_any = False
     for baud in BAUDRATES:
         try:
             with serial.Serial(port, baud, timeout=0.02, write_timeout=0.2) as ser:
+                opened_any = True
                 found = [i for i in SCAN_IDS if ping(ser, i)]
+        except termios.error as e:
+            # The CH9102 does not accept every rate in BAUDRATES and raises
+            # termios EINVAL rather than a SerialException. Not a fault -- skip
+            # the rate and keep going, otherwise one unsupported speed aborts a
+            # scan that has already found every servo.
+            print(f"  baudrate {baud:>9}: unsupported by this adapter ({e})")
+            continue
         except serial.SerialException as e:
-            print(f"  cannot open port: {e}")
-            return None
+            print(f"  baudrate {baud:>9}: {e}")
+            continue
         if found:
             hits[baud] = found
             print(f"  baudrate {baud:>9}: ids {found}")
+    if not opened_any:
+        print(f"\nFAIL: could not open {port} at any baudrate.")
+        print("  Another process may hold it -- check with: fuser -v " + port)
+        return None
     if not hits:
-        print("\nFAIL: nothing answered at any baudrate.")
-        print("  Check 12V servo power, the data chain seating, and the port.")
+        print("\nFAIL: port opens but nothing answered at any baudrate.")
+        print("  Check servo power, the data chain seating, and the port.")
         return None
     return hits
 

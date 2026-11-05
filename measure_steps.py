@@ -65,7 +65,7 @@ TRAVEL = {
 }
 
 
-def settle(leader, name: str, timeout: float = 1.5, still_for: float = 0.25) -> float:
+def settle(leader, name: str, timeout: float = 3.0, still_for: float = 0.4) -> float:
     """Wait until the joint stops moving, then return an averaged position.
 
     Polls until the reading has not changed by more than one tick for
@@ -109,8 +109,18 @@ def main() -> int:
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--max-excursion", type=float, default=15.0,
                         help="refuse to command more than this far from the start pose")
+    parser.add_argument("--velocity", type=int, default=300,
+                        help="Goal_Velocity during the test. BEWARE: 0 means MAXIMUM "
+                             "speed on Feetech STS, not 'stationary', and slams the "
+                             "joint hard enough to overshoot and trip overload")
+    parser.add_argument("--accel", type=int, default=20,
+                        help="Acceleration during the test (factory default is 254, "
+                             "near maximum)")
     parser.add_argument("-o", "--out", metavar="FILE", help="append a markdown report")
     parser.add_argument("--yes", action="store_true", help="skip the torque confirmation")
+    parser.add_argument("--center", action="store_true",
+                        help="if the joint sits too near a travel limit, drive it to "
+                             "mid-travel first in 10 deg hops instead of refusing")
     args = parser.parse_args()
 
     name = args.joint
@@ -147,11 +157,14 @@ def main() -> int:
     home = settle(leader, name)
     lo, hi = TRAVEL[name]
     worst = max(abs(s) for s in args.steps)
-    if not (lo < home - worst and home + worst < hi):
+    need_center = not (lo < home - worst and home + worst < hi)
+
+    if need_center and not args.center:
         print(
             f"\nRefusing to run: {name} is at {home:.1f} deg, too close to its "
             f"travel limits ({lo:.1f} .. {hi:.1f}) for a +-{worst:g} deg test.\n"
-            f"Move the joint nearer the middle of its range by hand and re-run.",
+            f"Move the joint nearer the middle of its range by hand, or pass "
+            f"--center to have it driven there gently.",
             file=sys.stderr,
         )
         leader.disconnect()
@@ -184,14 +197,43 @@ def main() -> int:
         "",
     ]
     rc = 0
+    prev_vel = prev_acc = None  # so the finally block can tell if we got that far
 
     try:
+        # Tame the motion profile BEFORE enabling torque.
+        #
+        # The factory/donor state on this arm is Goal_Velocity=0 and
+        # Acceleration=254. On Feetech STS, Goal_Velocity=0 means MAXIMUM
+        # speed, not stationary -- so every goal write becomes a full-speed
+        # slam. Measured consequence: a 1 deg command produced 11.4 deg
+        # achieved with 35.7 deg stddev as the joint snapped and oscillated,
+        # and the repeated slamming tripped the servo's overload protection.
+        # A settling-time measurement needs the joint to arrive, not to ring.
+        prev_vel = leader.bus.read("Goal_Velocity", name, normalize=False)
+        prev_acc = leader.bus.read("Acceleration", name, normalize=False)
+        leader.bus.write("Goal_Velocity", name, args.velocity, normalize=False)
+        leader.bus.write("Acceleration", name, args.accel, normalize=False)
+        print(f"motion profile  velocity {prev_vel} -> {args.velocity}, "
+              f"acceleration {prev_acc} -> {args.accel}")
+
         # CRITICAL ORDER: park the goal at the present position first, so
         # enabling torque holds the current pose instead of chasing a stale
         # register value.
         leader.bus.write("Goal_Position", name, home)
         leader.bus.enable_torque(name)
         time.sleep(0.2)
+
+        if args.center:
+            # Walk to mid-travel in small hops rather than one long command, so
+            # the joint is never asked to cross a large gap in one go even if
+            # the velocity cap is wrong for this joint's inertia.
+            target = (lo + hi) / 2.0
+            print(f"centering {name}: {home:.1f} -> {target:.1f} deg, 10 deg at a time")
+            while abs(target - home) > 1.0:
+                hop = max(-10.0, min(10.0, target - home))
+                home = goto(leader, name, home + hop)
+                print(f"  at {home:7.2f}")
+            print(f"centered at {home:.2f} deg")
 
         report.append("| step | mean achieved | error | repeatability (stddev) | detectable |")
         report.append("|---|---|---|---|---|")
@@ -269,8 +311,14 @@ def main() -> int:
     finally:
         # Always, on every path. The arm must be left limp.
         try:
+            # Torque first -- de-energising matters more than tidying
+            # registers, and an overload flag can make later writes fail.
             leader.bus.disable_torque(name)
             print("torque disabled")
+            if prev_vel is not None:
+                leader.bus.write("Goal_Velocity", name, prev_vel, normalize=False)
+                leader.bus.write("Acceleration", name, prev_acc, normalize=False)
+                print("motion profile restored")
         except Exception as exc:  # noqa: BLE001 - must not mask the real error
             print(f"WARNING: could not disable torque on {name}: {exc}", file=sys.stderr)
             print("Power-cycle the arm before handling it.", file=sys.stderr)
