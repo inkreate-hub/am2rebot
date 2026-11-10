@@ -41,19 +41,53 @@ Damiao part numbers:
 Ivan has the **RS** (Robstride) variant. Those model strings are passed
 straight to motorbridge, so they are wrong for this arm.
 
-The capability exists one layer down: motorbridge 0.3.9 exports
-`Mode.ROBSTRIDE_POS_VEL_CSP` alongside the Damiao `POS_VEL` / `MIT` /
-`FORCE_POS` modes. So the options are:
+The capability exists one layer down. motorbridge 0.3.9 has full Robstride
+support:
 
-  a. Subclass `RebotB601Follower` with an RS motor-model table and the
-     Robstride mode. Smallest change, keeps lerobot's limit handling.
-  b. Drive motorbridge directly from this backend in
-     `Mode.ROBSTRIDE_POS_VEL_CSP`, which is what the simulated backend already
-     emulates.
-  c. Use Seeed's `reBotArm_control_py`, which is written for their hardware.
+    Controller.from_socketcanfd(channel="can0")
+    Controller.add_robstride_motor(motor_id, feedback_id, model)
+    Motor.robstride_send_pos_vel_csp(...)      # Mode.ROBSTRIDE_POS_VEL_CSP = 5
+    Motor.robstride_ping / robstride_get_fault_report / set_zero_position
 
-Do not assume (a) works until the motor models are confirmed against the
-actual RS part numbers -- a wrong model means wrong scaling on every command.
+RS HARDWARE FACTS, from Seeed's B601-RS wiki:
+
+    joint        CAN id   model
+    J1 shoulder_pan   1    RS06
+    J2 shoulder_lift  2    RS06
+    J3 elbow_flex     3    RS06
+    J4 wrist_flex     4    RS00
+    J5 wrist_yaw      5    RS00
+    J6 wrist_roll     6    RS00
+    J7 gripper        7    RS00
+
+    supply   48 V DC
+    CAN      1 Mbit/s, **classic CAN, not CAN FD**
+    setup    sudo ip link set can0 down
+             sudo ip link set can0 up type can bitrate 1000000
+
+Two mismatches to resolve before trusting any of this:
+
+  - motorbridge only exposes `from_socketcanfd`, but the arm is classic CAN at
+    1 Mbit/s. A CAN FD controller does carry classic frames, so this probably
+    works -- but "probably" is not good enough before energising a 48 V arm.
+    Verify with `robstride_ping` on one motor and nothing else connected.
+  - lerobot's `motor_can_ids` pairs each joint with a feedback id (0x11..0x17).
+    That is a Damiao convention; Seeed document the RS motors as plain ids
+    1..7. Confirm the RS feedback-id scheme before adding motors.
+
+So the options are:
+
+  a. Seeed's own `rebot` package (`ReBotRSMITController`), which is written for
+     this exact arm and reads its motor table from
+     `config/rebotarm_rs.yaml`. Shortest path to a moving arm.
+  b. Drive motorbridge directly in `Mode.ROBSTRIDE_POS_VEL_CSP`, which is what
+     the simulated backend already emulates, so the control mode matches and
+     only the transport changes.
+  c. Subclass `RebotB601Follower` with an RS motor table. Keeps lerobot's
+     limit handling, but that class is DM-shaped throughout.
+
+Recommendation: (a) to confirm the arm moves and the ids/models are right,
+then (b) behind this interface so the AH stack owns the safety.
 
 ⚠️ THE SIMULATED MAPPING DOES NOT TRANSFER
 
@@ -127,6 +161,35 @@ class RealB601Backend(AHArm):
         False
     """
 
+    #: Robstride motor model per joint, from Seeed's B601-RS wiki. The three
+    #: shoulder joints carry the larger RS06; wrists and gripper are RS00.
+    #: These strings go straight to motorbridge's add_robstride_motor, and a
+    #: wrong model means wrong scaling on every command.
+    RS_MOTOR_MODELS: dict[str, str] = {
+        "shoulder_pan": "RS06",
+        "shoulder_lift": "RS06",
+        "elbow_flex": "RS06",
+        "wrist_flex": "RS00",
+        "wrist_yaw": "RS00",
+        "wrist_roll": "RS00",
+        "gripper": "RS00",
+    }
+
+    #: CAN id per joint, 1..7 in joint order.
+    RS_CAN_IDS: dict[str, int] = {
+        "shoulder_pan": 1,
+        "shoulder_lift": 2,
+        "elbow_flex": 3,
+        "wrist_flex": 4,
+        "wrist_yaw": 5,
+        "wrist_roll": 6,
+        "gripper": 7,
+    }
+
+    #: Classic CAN at 1 Mbit/s. NOT CAN FD, despite motorbridge only exposing
+    #: from_socketcanfd.
+    CAN_BITRATE = 1_000_000
+
     def __init__(
         self,
         port: str = "can0",
@@ -140,12 +203,21 @@ class RealB601Backend(AHArm):
     def _open(self) -> None:
         raise NotImplementedError(
             "RealB601Backend is a contract stub -- physical CAN actuation is a "
-            "later milestone.\n"
-            "To implement: wrap lerobot's rebot_b601_follower (it already takes "
-            "degrees under these joint names), supply the REAL mechanism joint "
-            "limits rather than the MuJoCo model's, set its "
-            "max_relative_target, and require the sit-down pose at connect "
-            "because the arm re-zeroes every session.\n"
+            "later milestone.\n\n"
+            "This arm is the RS (Robstride) variant, so lerobot's "
+            "rebot_b601_follower is NOT a drop-in: it is written for the DM "
+            "and its motor table is hard-coded to Damiao part numbers.\n\n"
+            "Before anything is energised:\n"
+            f"  sudo ip link set {self.port} down\n"
+            f"  sudo ip link set {self.port} up type can bitrate "
+            f"{self.CAN_BITRATE}\n"
+            "  48 V supply, arm parked in its sit-down pose (it re-zeroes "
+            "every session)\n\n"
+            "Then: ping one motor with motorbridge's robstride_ping before "
+            "adding all seven, supply the REAL joint limits rather than the "
+            "MuJoCo model's, set max_relative_target, and re-verify every "
+            "joint direction on hardware -- the simulated signs were measured "
+            "against the MJCF's axes, not the motors'.\n\n"
             "See ah/backends/real_b601.py for the full contract."
         )
 
