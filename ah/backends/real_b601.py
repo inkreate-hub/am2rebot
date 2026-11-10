@@ -60,7 +60,27 @@ RS HARDWARE FACTS, from Seeed's B601-RS wiki:
     J6 wrist_roll     6    RS00
     J7 gripper        7    RS00
 
-    supply   48 V DC
+    supply   48 V DC / 12.5 A, per Seeed's own reBot Arm 102 + B601-RS training
+             guide. Ours is a Mean Well **LRS-600-48** (48 V, 12.5 A, 600 W),
+             which meets that exactly -- some resellers suggest 25 A "for full
+             performance", so 12.5 A is the floor, not headroom.
+
+             ⚠️ LRS-600 input range is **switch-selectable** 90-132 / 180-264
+             VAC. German mains is 230 V. If the switch arrives on 115 V, mains
+             destroys the unit. Check it before the plug goes in.
+
+             ⚠️ Overload protection is hiccup mode -- constant-current limit,
+             auto-recovering. If a fast multi-joint move trips it, the rail dips
+             and **all seven motors lose torque simultaneously and the arm
+             falls**. There is no graceful degradation. This is a reason to keep
+             `max_speed_dps` conservative on the real backend, not just a
+             reason to buy a bigger PSU.
+
+             Quoted motor currents are PHASE current, not bus current: RS06 is
+             14.3 Apk rated / 57 Apk peak, RS00 4.7 / 15.5 Apk. Do not sum those
+             and conclude the arm needs 40+ A from the supply -- in FOC the DC
+             draw is a fraction of phase current. It converges upward only when
+             holding high torque against a stall.
     CAN      1 Mbit/s, **classic CAN, not CAN FD**
     setup    sudo ip link set can0 down
              sudo ip link set can0 up type can bitrate 1000000
