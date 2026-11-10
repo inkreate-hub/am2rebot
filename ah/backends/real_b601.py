@@ -29,6 +29,57 @@ interface:
 Recommendation when the time comes: start at (1). The simulated backend already
 emulates POS_VEL, so the control mode matches and only the transport changes.
 
+⚠️ LEROBOT'S FOLLOWER TARGETS THE **DM** VARIANT, NOT RS
+
+`RebotB601Follower`'s own docstring says "reBot B601-DM follower arm (6-DOF +
+gripper, Damiao CAN motors)", and its `MOTOR_MODELS` table is hard-coded to
+Damiao part numbers:
+
+    shoulder_pan/lift/elbow -> "4340P"
+    wrist_*/gripper         -> "4310"
+
+Ivan has the **RS** (Robstride) variant. Those model strings are passed
+straight to motorbridge, so they are wrong for this arm.
+
+The capability exists one layer down: motorbridge 0.3.9 exports
+`Mode.ROBSTRIDE_POS_VEL_CSP` alongside the Damiao `POS_VEL` / `MIT` /
+`FORCE_POS` modes. So the options are:
+
+  a. Subclass `RebotB601Follower` with an RS motor-model table and the
+     Robstride mode. Smallest change, keeps lerobot's limit handling.
+  b. Drive motorbridge directly from this backend in
+     `Mode.ROBSTRIDE_POS_VEL_CSP`, which is what the simulated backend already
+     emulates.
+  c. Use Seeed's `reBotArm_control_py`, which is written for their hardware.
+
+Do not assume (a) works until the motor models are confirmed against the
+actual RS part numbers -- a wrong model means wrong scaling on every command.
+
+⚠️ THE SIMULATED MAPPING DOES NOT TRANSFER
+
+`ah/mapping.py` is fitted against the MuJoCo model's limits. The real arm's
+are different, and not by a little:
+
+    joint           rs_arm.xml (sim)      lerobot (real)
+    shoulder_pan    -160.4 ..  160.4      -150 .. 150
+    shoulder_lift    -11.5 ..  179.9      -200 ..   1     <-- sign flipped
+    elbow_flex       -11.5 ..  179.9      -200 ..   1     <-- sign flipped
+    wrist_flex       -90.0 ..   90.0       -80 ..  90
+    wrist_yaw        -90.0 ..   90.0       -90 ..  90
+    wrist_roll      -179.9 ..  179.9       -90 ..  90     <-- half the travel
+    gripper            0.0 ..  100.0      -270 ..   0     <-- different unit
+
+shoulder_lift and elbow_flex are almost entirely POSITIVE in the model and
+almost entirely NEGATIVE on the real arm: different zero conventions, roughly
+180 deg apart. The gripper is a normalised 0-100 slide in the model and
+-270..0 DEGREES on the real arm.
+
+Because `JointMapper.from_ranges` takes the follower's limits from the live
+backend, the offsets re-derive themselves once `model_joint_limits()` returns
+the real numbers. **The directions do not.** They were verified against the
+MJCF's joint axes, which are not the motors' axes, so every sign has to be
+re-verified on the physical arm exactly as it was on the simulated one.
+
 WHAT MUST HOLD FOR THE SWAP TO BE SAFE
 
 - `model_joint_limits()` must return the *real* mechanism's limits. These are
