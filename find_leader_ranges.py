@@ -38,7 +38,8 @@ B601_LIMITS = {
 }
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--port", default="/dev/ttyACM0")
+parser.add_argument("--port", default=None,
+                    help="serial device; auto-detected if omitted")
 parser.add_argument("--id", default="am_leader")
 parser.add_argument("--profile", default="am-leader-6dof")
 parser.add_argument("--seconds", type=float, default=45.0)

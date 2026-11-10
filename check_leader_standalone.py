@@ -15,6 +15,7 @@ row which moves is the row you expect.
 """
 
 import argparse
+import glob
 import sys
 import termios
 import time
@@ -99,6 +100,17 @@ def read_u16(ser, motor_id, addr):
     if r is None or r[0] != motor_id or len(r[2]) < 2:
         return None
     return r[2][0] | (r[2][1] << 8)  # Feetech STS is little-endian
+
+
+def default_port():
+    """First /dev/ttyACM*, because the adapter re-enumerates on every replug.
+
+    Deliberately duplicated rather than imported from ah.leader: this script is
+    the one that must work with nothing but pyserial installed, so it can
+    diagnose a broken environment.
+    """
+    found = sorted(glob.glob("/dev/ttyACM*"))
+    return found[0] if found else "/dev/ttyACM0"
 
 
 def scan(port):
@@ -187,17 +199,19 @@ def positions(port, baud, watch):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None,
+                    help="serial device; auto-detected if omitted")
     ap.add_argument("--watch", action="store_true")
     args = ap.parse_args()
 
-    hits = scan(args.port)
+    port = args.port or default_port()
+    hits = scan(port)
     if hits is None:
         return 1
     verdict(hits)
     baud = max(hits, key=lambda b: len(hits[b]))
     try:
-        positions(args.port, baud, args.watch)
+        positions(port, baud, args.watch)
     except KeyboardInterrupt:
         print("\nstopped.")
     return 0

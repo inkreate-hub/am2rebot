@@ -44,6 +44,7 @@ EXAMPLES
 """
 
 import argparse
+import glob
 import csv
 import sys
 import time
@@ -96,11 +97,19 @@ SIGNS_RAW = {
 }
 
 
+
+def _find_port() -> str:
+    """First /dev/ttyACM*. The adapter re-enumerates on every replug, so a
+    hard-coded path goes stale; calibration is keyed by --id, not by port."""
+    found = sorted(glob.glob("/dev/ttyACM*"))
+    return found[0] if found else "/dev/ttyACM0"
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--port", default="/dev/ttyACM0")
+    parser.add_argument("--port", default=None,
+                    help="serial device; auto-detected if omitted")
     parser.add_argument("--id", default="am_leader", help="calibration id")
     parser.add_argument("--profile", default="am-leader-6dof")
     parser.add_argument("--fps", type=float, default=30.0, help="target sample rate")
@@ -131,8 +140,9 @@ def main() -> int:
     from lerobot.teleoperators.so_leader import SOLeader
     from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
 
+    port = args.port or _find_port()
     leader = SOLeader(
-        SOLeaderTeleopConfig(port=args.port, id=args.id, arm_profile=args.profile)
+        SOLeaderTeleopConfig(port=port, id=args.id, arm_profile=args.profile)
     )
     # calibrate=False: the stored calibration is loaded and reused. It must NOT
     # re-run the sweep -- a fresh sweep yields different (not wrong) offsets and

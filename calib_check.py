@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import sys
 from pathlib import Path
@@ -38,10 +39,19 @@ PROFILE = [
 ]
 
 
+
+def _find_port() -> str:
+    """First /dev/ttyACM*. The adapter re-enumerates on every replug, so a
+    hard-coded path goes stale; calibration is keyed by --id, not by port."""
+    found = sorted(glob.glob("/dev/ttyACM*"))
+    return found[0] if found else "/dev/ttyACM0"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--id", default="am_leader")
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None,
+                    help="serial device; auto-detected if omitted")
     args = ap.parse_args()
 
     fpath = (
@@ -56,7 +66,7 @@ def main():
     print(f"  present, {len(on_disk)} joints\n")
 
     motors = {n: Motor(i, "sts3215", MotorNormMode.DEGREES) for n, i in PROFILE}
-    bus = FeetechMotorsBus(args.port, motors)
+    bus = FeetechMotorsBus(args.port or _find_port(), motors)
     bus._connect(handshake=False)
     try:
         live = bus.read_calibration()

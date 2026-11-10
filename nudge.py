@@ -22,6 +22,7 @@ All four are RAM registers -- no EEPROM, no calibration touched.
 """
 
 import argparse
+import glob
 import sys
 import time
 
@@ -43,6 +44,13 @@ def decode_status(status: int) -> str:
     return ", ".join(v for k, v in STATUS_BITS.items() if status & k) or "ok"
 
 
+
+def _find_port() -> str:
+    """First /dev/ttyACM*. The adapter re-enumerates on every replug, so a
+    hard-coded path goes stale; calibration is keyed by --id, not by port."""
+    found = sorted(glob.glob("/dev/ttyACM*"))
+    return found[0] if found else "/dev/ttyACM0"
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -51,7 +59,8 @@ def main() -> int:
     p.add_argument("--increment", type=float, default=2.0)
     p.add_argument("--velocity", type=int, default=300)
     p.add_argument("--accel", type=int, default=20)
-    p.add_argument("--port", default="/dev/ttyACM0")
+    p.add_argument("--port", default=None,
+                    help="serial device; auto-detected if omitted")
     p.add_argument("--id", default="am_leader")
     args = p.parse_args()
 
@@ -60,7 +69,8 @@ def main() -> int:
     from lerobot.teleoperators.so_leader import SOLeader
     from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
 
-    leader = SOLeader(SOLeaderTeleopConfig(port=args.port, id=args.id,
+    port = args.port or _find_port()
+    leader = SOLeader(SOLeaderTeleopConfig(port=port, id=args.id,
                                            arm_profile="am-leader-6dof"))
     leader.connect(calibrate=False)
     bus = leader.bus
