@@ -176,12 +176,21 @@ def main() -> int:
     parser.add_argument("--window", action="store_true", help="show the viewer")
     parser.add_argument("--port", default="/dev/ttyACM0")
     parser.add_argument("--leader-id", default="am_leader")
-    parser.add_argument("--hz", type=float, default=30.0)
+    parser.add_argument("--hz", type=float, default=30.0, help="control rate")
+    parser.add_argument("--render-hz", type=float, default=20.0,
+                        help="viewer refresh rate, decoupled from control")
     parser.add_argument("--seconds", type=float, default=0.0, help="0 = until Q/Ctrl-C")
     parser.add_argument("--engage-seconds", type=float, default=1.5)
     parser.add_argument("--stale-after", type=float, default=0.25)
-    parser.add_argument("--max-step-deg", type=float, default=5.0)
-    parser.add_argument("--max-speed-dps", type=float, default=120.0)
+    # Sized so the two caps bind at the same rate at the default 30 Hz:
+    # 8 deg/command * 30 Hz = 240 deg/s = --max-speed-dps. If they disagree the
+    # tighter one silently governs, and the step cap is rate-dependent, so it
+    # changes meaning whenever the loop slows down.
+    #
+    # These are SIMULATOR defaults. A real B601 wants far lower -- 48 V, 2.5 kg
+    # payload, and a mapping error becomes a fast swing rather than a bad plot.
+    parser.add_argument("--max-step-deg", type=float, default=8.0)
+    parser.add_argument("--max-speed-dps", type=float, default=240.0)
     parser.add_argument("--flip", default="", help="comma-separated joints to invert")
     parser.add_argument("--record", metavar="FILE", help="start recording immediately")
     args = parser.parse_args()
@@ -257,12 +266,27 @@ def main() -> int:
 
         n = 0
         last_word, last_print = "", 0.0
+        last_render = 0.0
+        render_period = 1.0 / args.render_hz if args.render_hz > 0 else 0.0
+        sync_ms: list[float] = []
         while not session.quit and time.perf_counter() < deadline:
             if viewer is not None and not viewer.is_running():
                 break
+            iter_t0 = time.perf_counter()
             status = session.tick()
-            if viewer is not None:
+
+            # Render at its own rate. viewer.sync() blocks on the GUI thread,
+            # and on this machine (Wayland, software GL on Intel Iris Xe) it
+            # costs ~46 ms -- far more than the 3.3 ms control tick. Calling it
+            # every iteration dragged the whole loop to 20 Hz, which then
+            # silently halved the follower's top speed via the per-command step
+            # cap. Physics and control stay at --hz; the picture updates at
+            # --render-hz.
+            if viewer is not None and iter_t0 - last_render >= render_period:
+                sync_t0 = time.perf_counter()
                 viewer.sync()
+                sync_ms.append((time.perf_counter() - sync_t0) * 1e3)
+                last_render = iter_t0
             n += 1
             # Only redraw when the state word changes or twice a second.
             # Printing a growing "STALE 230000 ms" line at loop rate turns a
@@ -281,7 +305,17 @@ def main() -> int:
                 end = "\n" if word != last_word else ""
                 print(f"\r{status:<34} {cells}", end=end, flush=True)
                 last_word, last_print = word, now
-            time.sleep(period)
+
+            # Sleep the REMAINDER of the period, not the whole period. Sleeping
+            # a fixed 1/hz after doing the work gave 48.9 ms iterations instead
+            # of 33.3 -- 20.5 Hz against a requested 30. That matters beyond
+            # tidiness: the step cap is a per-COMMAND limit, so a slower loop
+            # silently lowers the follower's top speed (5 deg at 20.5 Hz is
+            # 102 deg/s, which a hand beats easily). Measured: 208 step-cap
+            # interventions in 369 iterations, and the follower lagging.
+            slack = period - (time.perf_counter() - iter_t0)
+            if slack > 0:
+                time.sleep(slack)
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
@@ -304,6 +338,12 @@ def main() -> int:
             f"max {max(session.loop_ms):.2f}"
         )
         print(f"held on stale/failed input: {session.held_stale} iterations")
+        if sync_ms:
+            print(
+                f"viewer.sync: {len(sync_ms)} calls, mean "
+                f"{statistics.fmean(sync_ms):.1f} ms, max {max(sync_ms):.1f} "
+                f"(decoupled from control at {args.render_hz:g} Hz)"
+            )
 
     print("\n=== follower tracking error (actual - target), degrees ===")
     import statistics

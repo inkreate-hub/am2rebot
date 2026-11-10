@@ -84,7 +84,14 @@ class ReaderStats:
             f"bus read: mean {statistics.fmean(rd):.2f} ms, max {max(rd):.2f}",
         ]
         if self.deltas:
-            lines.append("per-sample joint movement (input jitter), degrees:")
+            # NOT pure jitter: this is total change between samples, so while
+            # the arm is being moved it is dominated by real motion. The true
+            # noise floor is the STATIONARY measurement -- 0.000 deg
+            # peak-to-peak on 6 of 7 joints, see reports/noise-floor.md.
+            lines.append(
+                "per-sample joint change, degrees "
+                "(motion + jitter; see reports/noise-floor.md for static noise):"
+            )
             for name, values in self.deltas.items():
                 if values:
                     lines.append(
