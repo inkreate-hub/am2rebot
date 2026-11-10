@@ -174,7 +174,8 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--window", action="store_true", help="show the viewer")
-    parser.add_argument("--port", default="/dev/ttyACM0")
+    parser.add_argument("--port", default=None,
+                        help="serial device; auto-detected if omitted")
     parser.add_argument("--leader-id", default="am_leader")
     parser.add_argument("--hz", type=float, default=30.0, help="control rate")
     parser.add_argument("--render-hz", type=float, default=20.0,
@@ -216,7 +217,7 @@ def main() -> int:
     print("\nMAPPING\n" + mapper.describe())
 
     reader = AMLeaderReader(
-        port=args.port, leader_id=args.leader_id, stale_after_s=args.stale_after
+        port=args.port or (AMLeaderReader.find_port() or "/dev/ttyACM0"), leader_id=args.leader_id, stale_after_s=args.stale_after
     )
     try:
         reader.connect()

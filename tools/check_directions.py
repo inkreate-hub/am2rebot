@@ -86,7 +86,8 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--window", action="store_true")
-    parser.add_argument("--port", default="/dev/ttyACM0")
+    parser.add_argument("--port", default=None,
+                        help="serial device; auto-detected if omitted")
     parser.add_argument("--leader-id", default="am_leader")
     args = parser.parse_args()
 
@@ -98,7 +99,10 @@ def main() -> int:
 
     mapper = JointMapper.from_ranges(arm.model_joint_limits())
 
-    reader = AMLeaderReader(port=args.port, leader_id=args.leader_id)
+    reader = AMLeaderReader(
+        port=args.port or (AMLeaderReader.find_port() or "/dev/ttyACM0"),
+        leader_id=args.leader_id,
+    )
     try:
         reader.connect()
     except Exception as exc:  # noqa: BLE001

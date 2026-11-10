@@ -159,6 +159,29 @@ class AMLeaderReader:
 
     # ---------------------------------------------------------------- lifecycle
 
+    @staticmethod
+    def find_port(preferred: str | None = None) -> str | None:
+        """Locate the leader's serial device.
+
+        This adapter re-enumerates on every replug and Linux hands out the next
+        free number, so the arm has appeared as ttyACM0 and ttyACM1 within one
+        session. Hard-coding a path turns a replug into a debugging session.
+        Calibration is keyed by `leader_id`, never by port, so any device that
+        answers is equally valid.
+
+        Args:
+            preferred: Try this path first if it exists.
+
+        Returns:
+            The first `/dev/ttyACM*` present, preferring `preferred`, or None.
+            Presence is not proof the servos are powered -- the adapter's logic
+            runs off USB, so the port exists even with the servo rail dead.
+        """
+        if preferred and Path(preferred).exists():
+            return preferred
+        candidates = sorted(Path("/dev").glob("ttyACM*"))
+        return str(candidates[0]) if candidates else None
+
     def connect(self) -> None:
         """Open the serial bus and load the stored calibration.
 
@@ -173,6 +196,13 @@ class AMLeaderReader:
         """
         from lerobot.teleoperators.so_leader import SOLeader
         from lerobot.teleoperators.so_leader.config_so_leader import SOLeaderTeleopConfig
+
+        # Fall back to whatever ttyACM* is present. The configured path may be
+        # stale after a replug; see find_port().
+        found = self.find_port(self.port)
+        if found and found != self.port:
+            logger.warning("leader not at %s, using %s instead", self.port, found)
+            self.port = found
 
         self._leader = SOLeader(
             SOLeaderTeleopConfig(
