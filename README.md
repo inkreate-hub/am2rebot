@@ -276,6 +276,11 @@ be audited rather than taken on trust.
 | `set_one_id.py` | Flash one servo id | **EEPROM** |
 | `calibrate_leader.py` | The calibration sweep | **EEPROM + JSON** |
 | `RUNBOOK.md` | Working notes, every gotcha found | — |
+| **`docs/B601_BRINGUP.md`** | **Physical B601-RS bring-up**, seven staged gates | — |
+| `tools/can_up.sh` | Bring `can0` up classic, 1 Mbit/s | link state |
+| `tools/can_check.py` | Stage 1: who answers on CAN, std vs ext framing | no |
+| `tools/rs_probe.py` | Stages 2-4: handshake, read, PMAX scale check, zero, ranges | `--zero` only |
+| `tools/rs_move_one.py` | Stage 5: first torque, one joint, bounded and logged | **MOVES THE ARM** |
 | `reports/` | Measurement output | — |
 | `setup.sh` / `install.sh` | Environment rebuild | — |
 | `patches/` | Local changes to upstream | — |
