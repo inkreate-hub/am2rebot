@@ -202,6 +202,38 @@ class JointMapper:
         }
         return cls(maps=maps)
 
+    def flip(self, name: str) -> int:
+        """Invert one joint's direction and re-fit it. Returns the new sign.
+
+        Re-fitting matters: `offset` is derived from `direction` in `fit_map`,
+        so flipping the sign alone would leave the joint centred on the wrong
+        value. This recomputes both, which keeps mid-travel mapped to
+        mid-travel.
+
+        Args:
+            name: AH joint name.
+
+        Returns:
+            The new direction, +1 or -1.
+
+        Raises:
+            KeyError: If the joint is not in this mapper.
+        """
+        current = self.maps[name]
+        self.maps[name] = fit_map(
+            current.leader_range, current.follower_range, -current.direction
+        )
+        return self.maps[name].direction
+
+    def directions(self) -> dict[str, int]:
+        """Current per-joint signs, for printing or saving."""
+        return {name: jm.direction for name, jm in self.maps.items()}
+
+    def flip_argument(self) -> str:
+        """The `--flip` value that reproduces the current directions."""
+        inverted = [n for n, jm in self.maps.items() if jm.direction < 0]
+        return ",".join(inverted) if inverted else "(none)"
+
     def __call__(self, leader: Mapping[str, float]) -> dict[str, float]:
         """Map leader angles to follower targets, in degrees.
 

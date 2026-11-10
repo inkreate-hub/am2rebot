@@ -116,6 +116,9 @@ class MuJoCoBackend(AHArm):
             loop.
         armature: Reflected rotor inertia per arm DoF, kg*m^2. See `ARMATURE` --
             the MJCF omits it and the wrist joints chatter without it.
+        kp_gripper: Gripper PD stiffness, N/m. The gripper uses a plain PD on
+            position rather than the arm's velocity cascade -- see `step()`.
+        kd_gripper: Gripper PD damping, N per m/s.
         offscreen_size: `(width, height)` of the offscreen framebuffer, for
             `mujoco.Renderer`. The MJCF declares none, so the 640x480 default
             otherwise caps rendered frames.
@@ -144,6 +147,8 @@ class MuJoCoBackend(AHArm):
         max_joint_vel: float = 2.0,
         substeps_per_command: int = 15,
         armature: float = ARMATURE,
+        kp_gripper: float = 6000.0,
+        kd_gripper: float = 60.0,
         offscreen_size: tuple[int, int] = (1280, 960),
         scenery: bool = False,
     ) -> None:
@@ -156,6 +161,8 @@ class MuJoCoBackend(AHArm):
         self.max_joint_vel = max_joint_vel
         self.substeps_per_command = substeps_per_command
         self.armature = armature
+        self.kp_gripper = kp_gripper
+        self.kd_gripper = kd_gripper
         self.offscreen_size = offscreen_size
         self.scenery = scenery
 
@@ -318,6 +325,32 @@ class MuJoCoBackend(AHArm):
             for name in self.joint_names:
                 qadr, dadr = self._qpos_adr[name], self._dof_adr[name]
                 pos_err = targets[name] - float(self.data.qpos[qadr])
+
+                aid = self._act_id[name]
+                lo, hi = self.model.actuator_ctrlrange[aid]
+
+                if name == GRIPPER_JOINT:
+                    # The gripper gets a plain PD on position, not the velocity
+                    # cascade, and no bias feedforward. Three reasons:
+                    #
+                    #  - It is a SLIDE joint in metres over 0.05 m of travel,
+                    #    not a hinge in radians, so the arm's gains are
+                    #    meaningless here.
+                    #  - joint_left and joint_right follow it through very
+                    #    stiff equality constraints (solref 0.001). qfrc_bias
+                    #    on that DoF is dominated by constraint forces rather
+                    #    than gravity, so feeding it forward drove the actuator
+                    #    to its -500 N rail and pushed the jaw past its own
+                    #    lower limit.
+                    #  - The MJCF says so: its comment specifies joint7 is
+                    #    driven by a PD controller in Python.
+                    force = (
+                        self.kp_gripper * pos_err
+                        - self.kd_gripper * float(self.data.qvel[dadr])
+                    )
+                    self.data.ctrl[aid] = float(np.clip(force, lo, hi))
+                    continue
+
                 # Position loop -> desired velocity, clamped so a large error
                 # does not demand an impossible rate.
                 vel_des = float(
@@ -326,8 +359,6 @@ class MuJoCoBackend(AHArm):
                 # Velocity loop -> torque, clamped to the actuator's ctrlrange,
                 # which carries the real motor's output limit.
                 vel_err = vel_des - float(self.data.qvel[dadr])
-                aid = self._act_id[name]
-                lo, hi = self.model.actuator_ctrlrange[aid]
 
                 # Gravity/bias feedforward. Without it this cascade has no
                 # integral term, so holding against gravity requires a standing

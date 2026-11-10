@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 if "--window" not in sys.argv:
     os.environ.setdefault("MUJOCO_GL", "egl")
 
-from ah import ARM_JOINTS  # noqa: E402
+from ah import ALL_JOINTS, ARM_JOINTS  # noqa: E402
 from ah.arm import SafetyLimits  # noqa: E402
 from ah.backends import MuJoCoBackend  # noqa: E402
 from ah.leader import AMLeaderReader  # noqa: E402
@@ -56,6 +56,7 @@ class Session:
     """Teleop state machine: engaging -> running, plus paused and held."""
 
     def __init__(self, arm, reader, mapper, engage_seconds: float) -> None:
+        self.joints = tuple(arm.joint_names)
         self.arm = arm
         self.reader = reader
         self.mapper = mapper
@@ -73,7 +74,7 @@ class Session:
         self.rows = 0
         self.held_stale = 0
         self.loop_ms: list[float] = []
-        self.track_err: dict[str, list[float]] = {n: [] for n in ARM_JOINTS}
+        self.track_err: dict[str, list[float]] = {n: [] for n in self.joints}
 
     # ------------------------------------------------------------------ engage
 
@@ -128,15 +129,15 @@ class Session:
         self.loop_ms.append((time.perf_counter() - t0) * 1e3)
 
         state = self.arm.get_state()
-        for name in ARM_JOINTS:
+        for name in self.joints:
             self.track_err[name].append(state.position[name] - state.target[name])
 
         if self.recording is not None and sample is not None:
             self.recording.writerow(
                 [f"{state.t_mono:.6f}", f"{state.t_unix:.6f}", status.split()[0]]
-                + [f"{sample.position.get(n, float('nan')):.4f}" for n in ARM_JOINTS]
-                + [f"{state.target[n]:.4f}" for n in ARM_JOINTS]
-                + [f"{state.position[n]:.4f}" for n in ARM_JOINTS]
+                + [f"{sample.position.get(n, float('nan')):.4f}" for n in self.joints]
+                + [f"{state.target[n]:.4f}" for n in self.joints]
+                + [f"{state.position[n]:.4f}" for n in self.joints]
                 + [f"{self.loop_ms[-1]:.3f}"]
             )
             self.rows += 1
@@ -156,9 +157,9 @@ class Session:
         self.recording = csv.writer(self._record_file)
         self.recording.writerow(
             ["t_mono", "t_unix", "state"]
-            + [f"leader_{n}" for n in ARM_JOINTS]
-            + [f"target_{n}" for n in ARM_JOINTS]
-            + [f"actual_{n}" for n in ARM_JOINTS]
+            + [f"leader_{n}" for n in self.joints]
+            + [f"target_{n}" for n in self.joints]
+            + [f"actual_{n}" for n in self.joints]
             + ["loop_ms"]
         )
         self.rows = 0
@@ -193,11 +194,15 @@ def main() -> int:
     parser.add_argument("--max-step-deg", type=float, default=8.0)
     parser.add_argument("--max-speed-dps", type=float, default=240.0)
     parser.add_argument("--flip", default="", help="comma-separated joints to invert")
+    parser.add_argument("--gripper", action="store_true",
+                        help="also drive the gripper (joint7). Off by default -- it is\n"
+                             "a documented follow-on, outside the six-joint scope")
     parser.add_argument("--record", metavar="FILE", help="start recording immediately")
     args = parser.parse_args()
 
+    joints = ALL_JOINTS if args.gripper else ARM_JOINTS
     flips = {n.strip() for n in args.flip.split(",") if n.strip()}
-    unknown = flips - set(ARM_JOINTS)
+    unknown = flips - set(joints)
     if unknown:
         parser.error(f"--flip: unknown joints {sorted(unknown)}")
 
@@ -206,13 +211,15 @@ def main() -> int:
             max_step_deg=args.max_step_deg, max_speed_dps=args.max_speed_dps
         ),
         scenery=True,
+        include_gripper=args.gripper,
     )
     arm.connect()
     arm.settle(0.5)
 
     mapper = JointMapper.from_ranges(
         arm.model_joint_limits(),
-        directions={n: (-1 if n in flips else 1) for n in ARM_JOINTS},
+        directions={n: (-1 if n in flips else 1) for n in joints},
+        joints=joints,
     )
     print("\nMAPPING\n" + mapper.describe())
 
@@ -234,6 +241,19 @@ def main() -> int:
 
     def on_key(keycode: int) -> None:
         key = chr(keycode) if 32 <= keycode < 127 else ""
+        if key.isdigit() and key != "0":
+            # Live direction flip. Sign cannot be derived from either model --
+            # the leader's was measured on hardware and the MJCF's joint axes
+            # are mixed -- so the fastest honest way to resolve it is to invert
+            # the joint while watching it and see which way looks right.
+            index = int(key) - 1
+            if index < len(joints):
+                name = joints[index]
+                sign = session.mapper.flip(name)
+                session.engage()   # re-fit changes the target; ramp, do not snap
+                print(f"\n[{key}] {name} direction -> {sign:+d}   "
+                      f"--flip {session.mapper.flip_argument()}")
+            return
         if key == " ":
             session.paused = not session.paused
             print(f"\n[{'PAUSED' if session.paused else 'RESUMED'}]")
@@ -248,7 +268,10 @@ def main() -> int:
             session.quit = True
 
     print(f"\nleader {args.port} -> simulated B601-RS at {args.hz:g} Hz")
-    print("SPACE pause/resume   E re-engage   R record   Q quit\n")
+    print("SPACE pause/resume   E re-engage   R record   Q quit")
+    print("1-%d  flip that joint's direction while watching it:" % len(joints))
+    print("     " + "   ".join(f"{i}={n}" for i, n in enumerate(joints, 1)))
+    print()
 
     period = 1.0 / args.hz
     deadline = time.perf_counter() + args.seconds if args.seconds > 0 else float("inf")
@@ -355,6 +378,11 @@ def main() -> int:
                 f"  {name:<15} mean {statistics.fmean(errors):+7.3f}  "
                 f"max |err| {max(abs(e) for e in errors):6.3f}"
             )
+    print("\n=== final directions ===")
+    for name, sign in session.mapper.directions().items():
+        print(f"  {name:<15}{sign:+d}")
+    print(f"\nreproduce with:  --flip {session.mapper.flip_argument()}")
+
     print(f"\n{arm.safety_report()}")
     if session.rows:
         print(f"recorded {session.rows} rows to {record_path}")
