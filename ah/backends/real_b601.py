@@ -75,19 +75,57 @@ Two mismatches to resolve before trusting any of this:
     That is a Damiao convention; Seeed document the RS motors as plain ids
     1..7. Confirm the RS feedback-id scheme before adding motors.
 
+LEROBOT ALREADY HAS A ROBSTRIDE BUS -- and it settles the FD question
+
+`lerobot/motors/robstride/` ships `RobstrideMotorsBus`, built on python-can
+rather than motorbridge, and its constructor takes **`use_can_fd: bool = True`**
+and `bitrate: int = 1_000_000`. So classic CAN at 1 Mbit/s is a supported
+configuration on this path, where motorbridge only exposes `from_socketcanfd`.
+That removes the one blocker that could not be resolved by reading alone:
+
+    RobstrideMotorsBus(port="can0", motors={...},
+                       can_interface="socketcan",
+                       use_can_fd=False, bitrate=1_000_000)
+
+Two caveats, both from the source:
+
+  - `tables.py` names the models **`O0` .. `O6`** (plus `ELO5`), not `RS00` /
+    `RS06`. Numerically 1:1 with Robstride's part numbers, so RS00 -> "O0" and
+    RS06 -> "O6" -- but that correspondence is INFERRED from the numbering, not
+    documented, and the limit table makes it worth checking: `O6` carries
+    `PMAX 112.5 rad` against `12.57` (= 4*pi) for every other model, which
+    suggests a different reduction. Wrong model means wrong scaling on every
+    command, so confirm against one motor before adding seven.
+  - The file's own first line is
+    `TODO(Virgile): only the MIT protocole is implemented for now`. `POS_VEL`
+    exists in its `ControlMode` enum but is not wired up. The simulated backend
+    emulates POS_VEL, so on this path the control mode does NOT match -- MIT is
+    a torque law with kp/kd, which is closer to the cascade in
+    `MuJoCoBackend.step()` than to a position interface. `RebotB601Follower`
+    already defaults to `control_mode="mit"` with per-joint gains, which is a
+    useful starting point for the gains.
+
 So the options are:
 
   a. Seeed's own `rebot` package (`ReBotRSMITController`), which is written for
      this exact arm and reads its motor table from
-     `config/rebotarm_rs.yaml`. Shortest path to a moving arm.
-  b. Drive motorbridge directly in `Mode.ROBSTRIDE_POS_VEL_CSP`, which is what
-     the simulated backend already emulates, so the control mode matches and
-     only the transport changes.
-  c. Subclass `RebotB601Follower` with an RS motor table. Keeps lerobot's
-     limit handling, but that class is DM-shaped throughout.
+     `config/rebotarm_rs.yaml`. Shortest path to a moving arm. **Not installed
+     on this machine.**
+  b. `RobstrideMotorsBus` with `use_can_fd=False`, driven from this backend.
+     Needs `python-can` (also not installed) and MIT gains, but it is in-tree,
+     Apache-2.0, and already handles handshake, enable/disable, fault clear and
+     `set_zero_position`.
+  c. Drive motorbridge directly in `Mode.ROBSTRIDE_POS_VEL_CSP`, matching what
+     the simulated backend emulates -- but motorbridge is FD-only, which is the
+     unverified part.
+  d. Subclass `RebotB601Follower` with an RS motor table. Keeps lerobot's limit
+     handling, but that class is DM-shaped throughout: it calls
+     `add_damiao_motor` unconditionally, for both the `damiao` and the
+     `socketcan` adapter.
 
-Recommendation: (a) to confirm the arm moves and the ids/models are right,
-then (b) behind this interface so the AH stack owns the safety.
+Recommendation: (a) if Seeed's package can be obtained, purely to confirm the
+arm moves and that the ids and models are right. Otherwise (b), behind this
+interface so the AH stack keeps owning the safety.
 
 ⚠️ THE SIMULATED MAPPING DOES NOT TRANSFER
 
@@ -165,6 +203,10 @@ class RealB601Backend(AHArm):
     #: shoulder joints carry the larger RS06; wrists and gripper are RS00.
     #: These strings go straight to motorbridge's add_robstride_motor, and a
     #: wrong model means wrong scaling on every command.
+    #:
+    #: ⚠️ lerobot's `RobstrideMotorsBus` uses different strings for the same
+    #: motors -- `O0` .. `O6`, see `LEROBOT_MODEL_NAMES` below. Which table
+    #: applies depends on which transport this backend ends up using.
     RS_MOTOR_MODELS: dict[str, str] = {
         "shoulder_pan": "RS06",
         "shoulder_lift": "RS06",
@@ -186,8 +228,16 @@ class RealB601Backend(AHArm):
         "gripper": 7,
     }
 
+    #: Same motors as `RS_MOTOR_MODELS`, named the way lerobot's
+    #: `motors/robstride/tables.py` names them. The mapping is INFERRED from the
+    #: part numbering (RS00 -> O0, RS06 -> O6) and is not documented anywhere;
+    #: verify against one motor before trusting it, especially O6, whose PMAX is
+    #: 112.5 rad where every other model is 12.57.
+    LEROBOT_MODEL_NAMES: dict[str, str] = {"RS00": "O0", "RS06": "O6"}
+
     #: Classic CAN at 1 Mbit/s. NOT CAN FD, despite motorbridge only exposing
-    #: from_socketcanfd.
+    #: from_socketcanfd. lerobot's RobstrideMotorsBus takes `use_can_fd=False`
+    #: at this bitrate, so that path does support classic frames.
     CAN_BITRATE = 1_000_000
 
     def __init__(
