@@ -124,6 +124,17 @@ class MuJoCoBackend(AHArm):
             otherwise caps rendered frames.
         scenery: Add non-colliding lights and a floor so renders are legible.
             Off by default -- headless physics does not need it.
+        self_collision: `"model"` keeps the arm's real self-collisions, minus
+            the pairs in `SELF_COLLISION_EXCLUDES`. `"off"` excludes every
+            body pair so the arm passes through itself.
+
+            This is a genuine trade-off, not a bug toggle. Measured across the
+            teleop envelope the leader maps to, 46% of reachable poses put some
+            body pair in contact -- link1/link4 in 15%, link1/link3 in 13%,
+            base_link/link3 in 13%. Those are the arm folding into its own
+            base, which a real B601 cannot do either. But from the operator's
+            side a blocked joint is indistinguishable from a broken one, so
+            `"off"` exists for demos where smooth motion matters more.
 
     Example:
         >>> from ah.backends import MuJoCoBackend
@@ -151,6 +162,7 @@ class MuJoCoBackend(AHArm):
         kd_gripper: float = 60.0,
         offscreen_size: tuple[int, int] = (1280, 960),
         scenery: bool = False,
+        self_collision: str = "model",
     ) -> None:
         super().__init__(limits)
         self.model_path = str(model_path or MODEL_PATH)
@@ -165,6 +177,9 @@ class MuJoCoBackend(AHArm):
         self.kd_gripper = kd_gripper
         self.offscreen_size = offscreen_size
         self.scenery = scenery
+        if self_collision not in ("model", "off"):
+            raise ValueError("self_collision must be 'model' or 'off'")
+        self.self_collision = self_collision
 
         self.model: mujoco.MjModel | None = None
         self.data: mujoco.MjData | None = None
@@ -180,7 +195,16 @@ class MuJoCoBackend(AHArm):
         # before compiling. See SELF_COLLISION_EXCLUDES -- without these the
         # arm is seized in every pose.
         spec = mujoco.MjSpec.from_file(self.model_path)
-        for body1, body2 in SELF_COLLISION_EXCLUDES:
+        excludes = list(SELF_COLLISION_EXCLUDES)
+        if self.self_collision == "off":
+            # Every body pair, so nothing can collide with anything. The arm
+            # will pass through its own base. Use only when a smooth demo
+            # matters more than physical honesty.
+            bodies = [b.name for b in spec.bodies if b.name and b.name != "world"]
+            excludes = [
+                (a, b) for i, a in enumerate(bodies) for b in bodies[i + 1 :]
+            ] + [("world", b) for b in bodies]
+        for body1, body2 in excludes:
             exclude = spec.add_exclude()
             exclude.bodyname1 = body1
             exclude.bodyname2 = body2
@@ -374,6 +398,27 @@ class MuJoCoBackend(AHArm):
                 self.data.ctrl[aid] = float(np.clip(self.kv * vel_err + bias, lo, hi))
             mujoco.mj_step(self.model, self.data)
             self._sim_time += float(self.model.opt.timestep)
+
+    def contacts(self) -> list[tuple[str, str]]:
+        """Body pairs currently touching. Empty when the arm is free.
+
+        A joint that stops responding mid-teleop is usually this rather than a
+        control fault -- the constraint force cancels the actuator torque and
+        the joint simply stops, with no error anywhere.
+        """
+        assert self.model is not None and self.data is not None
+        out = []
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            pair = tuple(
+                mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, self.model.geom_bodyid[g]
+                )
+                for g in (contact.geom1, contact.geom2)
+            )
+            if pair not in out:
+                out.append(pair)
+        return out
 
     @property
     def sim_time(self) -> float:

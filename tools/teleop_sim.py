@@ -194,6 +194,10 @@ def main() -> int:
     parser.add_argument("--max-step-deg", type=float, default=8.0)
     parser.add_argument("--max-speed-dps", type=float, default=240.0)
     parser.add_argument("--flip", default="", help="comma-separated joints to invert")
+    parser.add_argument("--no-self-collision", action="store_true",
+                        help="let the arm pass through itself. 46%% of the mapped\n"
+                             "teleop envelope self-collides, and a blocked joint\n"
+                             "looks exactly like a broken one")
     parser.add_argument("--gripper", action="store_true",
                         help="also drive the gripper (joint7). Off by default -- it is\n"
                              "a documented follow-on, outside the six-joint scope")
@@ -212,6 +216,7 @@ def main() -> int:
         ),
         scenery=True,
         include_gripper=args.gripper,
+        self_collision="off" if args.no_self_collision else "model",
     )
     arm.connect()
     arm.settle(0.5)
@@ -269,6 +274,7 @@ def main() -> int:
 
     print(f"\nleader {args.port} -> simulated B601-RS at {args.hz:g} Hz")
     print("SPACE pause/resume   E re-engage   R record   Q quit")
+    print("live display:  N:leader/follower  per joint, then any BLOCKED contact")
     print("1-%d  flip that joint's direction while watching it:" % len(joints))
     print("     " + "   ".join(f"{i}={n}" for i, n in enumerate(joints, 1)))
     print()
@@ -319,15 +325,25 @@ def main() -> int:
             word = status.split()[0]
             if sys.stdout.isatty() and (word != last_word or now - last_print > 0.5):
                 lead = reader.last_good
+                actual = arm.get_joint_positions()
                 cells = (
-                    "  ".join(
-                        f"{k[:9]}:{v:7.1f}" for k, v in list(lead.position.items())[:3]
+                    " ".join(
+                        f"{i}:{lead.position.get(n, float('nan')):+6.0f}"
+                        f"/{actual[n]:+6.0f}"
+                        for i, n in enumerate(joints, 1)
                     )
                     if lead
                     else "no leader data"
                 )
+                # A blocked joint looks exactly like a broken one from outside.
+                touching = arm.contacts()
+                blocked = (
+                    "  BLOCKED: " + ", ".join(f"{a}/{b}" for a, b in touching[:2])
+                    if touching
+                    else ""
+                )
                 end = "\n" if word != last_word else ""
-                print(f"\r{status:<34} {cells}", end=end, flush=True)
+                print(f"\r{status:<22} {cells}{blocked}", end=end, flush=True)
                 last_word, last_print = word, now
 
             # Sleep the REMAINDER of the period, not the whole period. Sleeping
