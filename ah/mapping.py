@@ -62,6 +62,30 @@ LEADER_RANGES: dict[str, tuple[float, float]] = {
 }
 
 
+#: Verified leader -> follower directions, observed on hardware 2026-11-05.
+#:
+#: -1 means the follower joint must run opposite to the leader's reported
+#: angle. Established by driving the sim from the live leader and watching:
+#: elbow_flex, wrist_flex and wrist_yaw moved the wrong way, the other three
+#: were correct.
+#:
+#: NOT a calibration property, and re-calibrating will not change it. A
+#: calibration sweep sets each joint's zero and range; the sign comes from how
+#: the servo horn was physically seated on the leader and which way the MJCF's
+#: joint axis points (`rs_arm.xml` is itself mixed -- joint1 is `0 0 -1` while
+#: joint2 is `0 0 1`). Re-running calibration would produce the same signs with
+#: different offsets, discarding the measured ranges below for nothing.
+DEFAULT_DIRECTIONS: dict[str, int] = {
+    "shoulder_pan": 1,
+    "shoulder_lift": 1,
+    "elbow_flex": -1,
+    "wrist_flex": -1,
+    "wrist_yaw": -1,
+    "wrist_roll": 1,
+    "gripper": 1,
+}
+
+
 @dataclass
 class JointMap:
     """One joint's leader -> follower conversion.
@@ -186,16 +210,16 @@ class JointMapper:
                 `arm.model_joint_limits()`. Taking them from the live backend
                 rather than a constant means the mapping cannot drift out of
                 step with the model.
-            directions: Per-joint +1/-1. Defaults to +1 for every joint, which
-                is a starting point and not a verified result.
+            directions: Per-joint +1/-1. Defaults to `DEFAULT_DIRECTIONS`,
+                which were observed on hardware rather than assumed.
             joints: Which joints to map. Defaults to the six arm joints.
         """
-        directions = directions or {}
+        directions = directions if directions is not None else DEFAULT_DIRECTIONS
         maps = {
             name: fit_map(
                 LEADER_RANGES[name],
                 tuple(follower_ranges[name]),
-                int(directions.get(name, 1)),
+                int(directions.get(name, DEFAULT_DIRECTIONS.get(name, 1))),
             )
             for name in joints
             if name in follower_ranges
@@ -230,9 +254,17 @@ class JointMapper:
         return {name: jm.direction for name, jm in self.maps.items()}
 
     def flip_argument(self) -> str:
-        """The `--flip` value that reproduces the current directions."""
-        inverted = [n for n, jm in self.maps.items() if jm.direction < 0]
-        return ",".join(inverted) if inverted else "(none)"
+        """The `--flip` value that reproduces the current directions.
+
+        Expressed as a difference from `DEFAULT_DIRECTIONS`, so an empty result
+        means "the verified set" rather than "all positive".
+        """
+        changed = [
+            n
+            for n, jm in self.maps.items()
+            if jm.direction != DEFAULT_DIRECTIONS.get(n, 1)
+        ]
+        return ",".join(changed) if changed else "(none - defaults are verified)"
 
     def __call__(self, leader: Mapping[str, float]) -> dict[str, float]:
         """Map leader angles to follower targets, in degrees.

@@ -49,7 +49,7 @@ from ah import ALL_JOINTS, ARM_JOINTS  # noqa: E402
 from ah.arm import SafetyLimits  # noqa: E402
 from ah.backends import MuJoCoBackend  # noqa: E402
 from ah.leader import AMLeaderReader  # noqa: E402
-from ah.mapping import JointMapper  # noqa: E402
+from ah.mapping import DEFAULT_DIRECTIONS, JointMapper  # noqa: E402
 
 
 class Session:
@@ -193,7 +193,9 @@ def main() -> int:
     # payload, and a mapping error becomes a fast swing rather than a bad plot.
     parser.add_argument("--max-step-deg", type=float, default=8.0)
     parser.add_argument("--max-speed-dps", type=float, default=240.0)
-    parser.add_argument("--flip", default="", help="comma-separated joints to invert")
+    parser.add_argument("--flip", default="",
+                        help="comma-separated joints to invert AGAINST the verified\n"
+                             "defaults in ah/mapping.py DEFAULT_DIRECTIONS")
     parser.add_argument("--no-self-collision", action="store_true",
                         help="let the arm pass through itself. 46%% of the mapped\n"
                              "teleop envelope self-collides, and a blocked joint\n"
@@ -223,7 +225,12 @@ def main() -> int:
 
     mapper = JointMapper.from_ranges(
         arm.model_joint_limits(),
-        directions={n: (-1 if n in flips else 1) for n in joints},
+        # --flip toggles AGAINST the verified defaults rather than against +1,
+        # so naming a joint inverts whatever was measured for it.
+        directions={
+            n: (-1 if n in flips else 1) * DEFAULT_DIRECTIONS.get(n, 1)
+            for n in joints
+        },
         joints=joints,
     )
     print("\nMAPPING\n" + mapper.describe())
