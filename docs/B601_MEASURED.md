@@ -84,6 +84,56 @@ positions are snapshotted to `calibration/b601_prezero_*.txt` before every
 zeroing run, because `set_zero_position()` otherwise destroys the only record
 of the previous reference.
 
+## Six joints under power — 2026-11-12
+
+±5°, 1° steps, 20 °/s, 90 °/s², POS_VEL profile mode. All passed.
+
+| joint | worst err | peak torque | temp | notes |
+|---|---|---|---|---|
+| `shoulder_pan` | 0.08° | 0.67 N·m | 29 flat | vertical axis, unloaded |
+| `wrist_roll` | 0.13° | 0.52 | 30 flat | roll axis, no gravity moment |
+| `wrist_yaw` | 0.21° | 1.10 | 29 flat | |
+| `shoulder_lift` | 0.22° | 3.00 | 29 flat | `--direction up` |
+| `wrist_flex` | 0.47° | 2.55 | 29→31 | gravity-loaded wrist |
+| `elbow_flex` | 0.47° | **6.18** | 29→30 | `--direction up` |
+| `gripper` | — | — | — | disassembled, not tested |
+
+Every ratio ≈1.00. **No scale error on an RS06 under load** — PMAX 12.57 rad
+is confirmed in motion, not just in a decoded frame.
+
+Gravity holding torque is ≈2.5 N·m on `shoulder_lift` and ≈4 N·m on
+`elbow_flex`, against 36 N·m rated. The shoulders are barely working. A
+`--max-torque 10` ceiling on an RS06 leaves ample headroom; real demand peaked
+at 62% of it.
+
+### `elbow_flex` was never damaged
+
+It broke away from its stop at **6.18 N·m**. The morning of the same day it
+hit **58.7 N·m** — 9.5× higher — being commanded −5° from a pose with 1.4° of
+negative travel. That number was the hard stop, not the joint.
+
+### Lost motion is mechanical, 0.2–0.5°
+
+Three independent signatures, all repeatable:
+
+1. **Breakaway.** First step off a stop loses motion and spikes torque:
+   `elbow_flex` ratio 0.53 at 6.18 N·m, `shoulder_lift` 0.81 at 2.87. Both
+   recover on the very next step (1.38, 1.16).
+2. **Incomplete return.** The last step down to home stops ~0.2° high *every
+   time* — `shoulder_lift` +0.20/+0.22, `elbow_flex` +0.18/+0.18, four of four.
+3. **Gravity reversal.** `wrist_flex` descending: at the step where torque
+   flips +0.69 → −2.03 N·m, it moves 0.73 of 1.00 commanded and errs 0.45°,
+   then over-travels 1.34 recovering. Ascending, the same at −1.15°
+   (ratio 0.75 → 1.30). The two crossings are **2.0° apart** — that is the
+   hysteresis band. `wrist_yaw` shows it weaker at ≈−10.5°.
+
+The joints with no gravity moment — `wrist_roll`, `shoulder_pan` — show none
+of this and sit at 0.08–0.13° throughout.
+
+**No gain setting removes any of this**, and in POS_VEL mode `kp` does not
+reach the wire anyway. 0.2–0.5° is the accuracy floor for teleop on the loaded
+joints; budget for it rather than tuning against it.
+
 ## Travel, measured by hand 2026-11-12
 
 Torque off, joint moved by hand to both ends. Endpoints are where the joint
