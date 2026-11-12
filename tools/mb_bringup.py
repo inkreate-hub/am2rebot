@@ -96,6 +96,31 @@ MOTOR_MODELS: dict[str, str] = {
     j: ("rs-06" if j in SHOULDER_JOINTS else "rs-00") for j in CAN_IDS
 }
 
+#: Rated continuous torque, N.m, from Seeed's spec. Halved for the abort
+#: ceiling below: a bounded few-degree bring-up move on an arm that is not
+#: carrying a payload has no business approaching half of rated.
+RATED_TORQUE_NM: dict[str, float] = {"rs-06": 36.0, "rs-00": 14.0}
+
+#: WHY THESE EXIST -- 2026-11-12, and it cost a motor 62 degC.
+#:
+#: `elbow_flex` was commanded -5 deg from a parked pose, drove into a hard
+#: stop at -1.4 deg, and ramped torque 7 -> 14 -> 30 -> 49 -> 58.7 N.m (1.6x
+#: its 36 N.m rating) across eight steps while the MOS temperature went
+#: 27 -> 62 degC. Then its protection tripped: torque 0.00, position frozen,
+#: and the remaining 24 steps logged a motor that was no longer there.
+#:
+#: Not one guard fired. `--abort-deg` is 15 and the error only reached 5.3.
+#: The ratio guard reads `abs(moved) > 0.2 and abs(ratio) < 0.25`, and that
+#: leading term EXEMPTS a motor that is not moving -- which is the definition
+#: of a stall. The guards were written to catch a position-scale error, and a
+#: stall is the opposite failure: perfect scale, no motion, rising torque.
+#:
+#: So torque and temperature are now watched directly. They are the two
+#: signals that move early in a stall -- torque crossed 30 N.m while the
+#: motor was still at 27 degC, a full five steps before anything got hot.
+STALL_TORQUE_FRAC = 0.5
+STALL_TEMP_C = 50.0
+
 #: RobStride's default host/master id. MotorBridge's own scan tries
 #: 0xFD, 0xFF, 0xFE, 0x00, 0xAA in that order, so 0xFD is the documented default
 #: rather than a guess. Note this is NOT the Damiao-style 0x10+id pairing that
@@ -276,7 +301,8 @@ def scan(args) -> int:
                       f"{'-':>10}{'-':>9}{'-':>8}{'-':>7}  SILENT")
 
         if faults:
-            print("\nFAULTS REPORTED -- clear these before energising:")
+            print("\nFAULTS REPORTED -- clear these before energising "
+                  "(--clear-faults), and fix the cause first:")
             for f in faults:
                 print(f"  {f}")
 
@@ -315,6 +341,63 @@ def scan(args) -> int:
         return 1
     finally:
         _reporting(motors.values(), False)
+        _shutdown(ctrl)
+
+
+def clear_faults(args) -> int:
+    """Clear latched faults on all seven. Enables no torque, commands no move.
+
+    `--scan` says "clear these before energising" and used to offer no way to
+    do it, which left the only documented recovery as a power cycle -- and a
+    power cycle also silently discards the zero, since `set_zero_position()`
+    is RAM-only until `store_parameters()`. Two unrelated things lost to one
+    blunt instrument.
+
+    Clearing a fault does not fix what caused it. Read the fault word first.
+    """
+    mb, ctrl, motors = _open(args)
+    try:
+        print("Reading faults before clearing. A fault on a motor that was "
+              "never energised points at the shared 48 V rail, not that "
+              "motor.\n")
+        before: dict[str, tuple[int, int]] = {}
+        for name in CAN_IDS:
+            try:
+                before[name] = motors[name].robstride_get_fault_report()
+            except Exception:  # noqa: BLE001
+                print(f"  {name:<15} unreadable")
+        for name, (f, w) in before.items():
+            if f or w:
+                print(f"  {name:<15} fault 0x{f:X}  warn 0x{w:X}")
+        if not any(f or w for f, w in before.values()):
+            print("  nothing latched. Nothing to clear.")
+            return 0
+
+        for name in CAN_IDS:
+            try:
+                motors[name].clear_error()
+                time.sleep(0.05)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {name:<15} clear failed: {exc}")
+
+        time.sleep(0.2)
+        still: list[str] = []
+        for name in CAN_IDS:
+            try:
+                f, w = motors[name].robstride_get_fault_report()
+                if f or w:
+                    still.append(f"{name} (fault 0x{f:X} warn 0x{w:X})")
+            except Exception:  # noqa: BLE001
+                pass
+        if still:
+            print(f"\nSTILL LATCHED: {', '.join(still)}\n"
+                  "A fault that will not clear is still present -- the motor "
+                  "is over temperature, or the rail is still out of range.")
+            return 1
+        print("\nAll clear. Re-run --scan to confirm, and fix the cause "
+              "before energising anything.")
+        return 0
+    finally:
         _shutdown(ctrl)
 
 
@@ -367,6 +450,10 @@ def move_one(args) -> int:
             return 1
 
         home = state["pos_deg"]
+        model = MOTOR_MODELS[name]
+        rated = RATED_TORQUE_NM[model]
+        tq_ceiling = (args.max_torque if args.max_torque is not None
+                      else rated * STALL_TORQUE_FRAC)
         plan = _plan(home, args.amplitude, args.cycles)
         mode_name = {MODE_MIT: "MIT (no motor-side limits!)",
                      MODE_CSP: "CSP", MODE_POS_VEL: "POS_VEL profile"}[
@@ -382,7 +469,8 @@ def move_one(args) -> int:
                  else "gains: motor-internal, ")
         print(f"steps <= {args.max_step_deg} deg, vlim {args.vlim_dps} dps, "
               f"acc {args.acc_dpss} dps^2, {gains}"
-              f"abort at {args.abort_deg} deg error")
+              f"abort at {args.abort_deg} deg error, "
+              f"{tq_ceiling:.1f} N.m, {args.max_temp:.0f} degC")
 
         if args.dry_run:
             print("\n--dry-run: nothing was enabled.")
@@ -440,10 +528,40 @@ def move_one(args) -> int:
                           f"wrong model string or wrong CAN id for this joint.")
                     return 1
 
+                # Stall: torque climbing into a joint that is not moving. The
+                # ratio guard above cannot see this -- it exempts small motion.
+                torque = s.get("torque", 0.0)
+                temp = s.get("temp", 0.0)
+                if math.isfinite(torque) and abs(torque) > tq_ceiling:
+                    print(f"\nABORT: torque {torque:+.2f} N.m exceeds "
+                          f"{tq_ceiling:.1f} ({model}, rated {rated:.0f}).\n"
+                          f"The joint moved {moved:+.2f} deg for a "
+                          f"{step:+.2f} deg command while pulling that.\n"
+                          f"It is driving into something: a mechanical stop, "
+                          f"the bench, or another link.\n"
+                          f"Do NOT raise the gain. Find the obstruction, and "
+                          f"check which direction has travel before retrying.")
+                    return 1
+                if math.isfinite(temp) and temp > args.max_temp:
+                    print(f"\nABORT: {temp:.0f} degC exceeds --max-temp "
+                          f"{args.max_temp:.0f}. Let it cool before retrying.")
+                    return 1
+
         print(f"\nworst tracking error: {worst:.2f} deg")
         if worst > 2.0:
-            print("Tracking is loose. Raise --kp a little, or the joint is "
-                  "fighting gravity with too little gain.")
+            # NOT "raise the gain". That was the old advice here, and on a
+            # stalled joint it is the one action that makes things worse --
+            # more current into a motor already driving against a hard stop.
+            # It is also wrong on its face in POS_VEL mode, where kp never
+            # reaches the wire. Say what was actually seen instead.
+            print(f"GATE NOT PASSED for {name}: worst error {worst:.2f} deg.\n"
+                  f"Read the torque column before changing anything:\n"
+                  f"  torque rising while the joint barely moves -> it is "
+                  f"driving into an obstruction. Find it.\n"
+                  f"  torque ~0 and position frozen -> the motor dropped out. "
+                  f"Check --scan for a fault, and check the 48 V rail.\n"
+                  f"  torque modest and motion smooth -> genuinely a tuning "
+                  f"problem, and only then does --mit --kp mean anything.")
             return 1
         print(f"GATE PASSED for {name}: tracked +-{args.amplitude} deg, no "
               f"fault, no scale error.\nNext joint. Wrists before shoulders.")
@@ -670,6 +788,8 @@ def main() -> int:
                         help="set zero to the present pose on all 7")
     action.add_argument("--move", action="store_true",
                         help="apply torque to ONE joint")
+    action.add_argument("--clear-faults", action="store_true",
+                        help="clear latched faults on all 7; no torque")
 
     p.add_argument("--joint", choices=sorted(CAN_IDS))
     p.add_argument("--amplitude", type=float, default=5.0,
@@ -686,6 +806,11 @@ def main() -> int:
     p.add_argument("--stream-hz", type=float, default=20.0,
                    help="rate at which the target is re-sent while held")
     p.add_argument("--abort-deg", type=float, default=15.0)
+    p.add_argument("--max-torque", type=float, default=None,
+                   help="N.m abort ceiling; default is half rated for the "
+                        "joint's model (rs-06 18.0, rs-00 7.0)")
+    p.add_argument("--max-temp", type=float, default=STALL_TEMP_C,
+                   help="degC abort ceiling")
     p.add_argument("--cycles", type=int, default=2)
     p.add_argument("--sweep-min", type=int, default=1)
     p.add_argument("--sweep-max", type=int, default=127)
@@ -709,6 +834,8 @@ def main() -> int:
         return sweep(args)
     if args.zero:
         return zero(args)
+    if args.clear_faults:
+        return clear_faults(args)
     if args.move:
         if not args.joint:
             p.error("--move needs --joint")
