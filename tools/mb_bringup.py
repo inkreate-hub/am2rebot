@@ -383,21 +383,55 @@ def ranges(args) -> int:
 
         lo: dict[str, float] = {}
         hi: dict[str, float] = {}
+        now: dict[str, float] = {}
+        samples = 0
+
+        # SAMPLE ALL SEVEN PER PASS, not one at a time. `_poll` sleeps 50 ms
+        # per motor while it waits on a request/response round trip, which for
+        # seven joints is ~3 Hz -- slow enough to sail straight past the
+        # endpoint of a hand-driven sweep and record the travel SHORT. Short
+        # travel is the dangerous direction: it is what lets `--move` plan into
+        # a stop. Active reporting is already on and every motor is streaming
+        # at ~10 Hz, so draining the socket and reading all seven cached states
+        # costs one pass and needs no request at all.
+        print(f"{'joint':<15}{'now':>9}{'min':>9}{'max':>9}{'travel':>9}")
+        print("-" * 51)
+        for _ in CAN_IDS:
+            print()
+
         try:
             while True:
+                for _ in range(24):
+                    try:
+                        ctrl.poll_feedback_once()
+                    except Exception:  # noqa: BLE001
+                        break
                 for name in CAN_IDS:
-                    s = _state_dict(_poll(motors[name], 1, ctrl))
+                    s = _state_dict(motors[name].get_state())
                     if "pos_deg" not in s:
                         continue
                     p = s["pos_deg"]
+                    now[name] = p
                     lo[name] = min(lo.get(name, p), p)
                     hi[name] = max(hi.get(name, p), p)
-                line = "  ".join(
-                    f"{n[:9]}:{lo.get(n, float('nan')):+7.1f}"
-                    f"/{hi.get(n, float('nan')):+7.1f}" for n in CAN_IDS)
-                print(f"\r{line}", end="", flush=True)
+                samples += 1
+
+                # Redraw in place: up N lines, rewrite each, clear to EOL.
+                sys.stdout.write(f"\033[{len(CAN_IDS)}A")
+                for name in CAN_IDS:
+                    if name in now:
+                        span = hi[name] - lo[name]
+                        mark = " <-" if span >= 2 * RANGE_MARGIN_DEG else ""
+                        sys.stdout.write(
+                            f"\033[2K{name:<15}{now[name]:>9.2f}"
+                            f"{lo[name]:>9.2f}{hi[name]:>9.2f}"
+                            f"{span:>9.2f}{mark}\n")
+                    else:
+                        sys.stdout.write(f"\033[2K{name:<15}{'no data':>9}\n")
+                sys.stdout.flush()
+                time.sleep(0.02)
         except KeyboardInterrupt:
-            print("\n")
+            print(f"\n{samples} samples.\n")
 
         if not lo:
             print("Nothing was recorded.", file=sys.stderr)
@@ -411,12 +445,25 @@ def ranges(args) -> int:
             if name not in lo:
                 continue
             span = hi[name] - lo[name]
+            print(f"{name:<15}{lo[name]:>9.2f}{hi[name]:>9.2f}{span:>9.2f}")
+            # A joint that never moved was never MEASURED, and recording it as
+            # a zero-width range would be a fabricated measurement gating a
+            # real move. Leave it out: an absent entry makes `--move` say
+            # "record it first", which is the truth. A present one would say
+            # "already at a stop", which is a guess.
+            if span < 1.0:
+                thin.append(name)
+                continue
             out[name] = {"min_deg": round(lo[name], 2),
                          "max_deg": round(hi[name], 2),
                          "travel_deg": round(span, 2)}
-            print(f"{name:<15}{lo[name]:>9.2f}{hi[name]:>9.2f}{span:>9.2f}")
-            if span < 2 * RANGE_MARGIN_DEG:
-                thin.append(name)
+
+        if not out:
+            print("\nNOTHING WAS MEASURED -- no joint moved more than 1 deg.\n"
+                  "No file written, because a range nobody measured is worse "
+                  "than no range at all.\nRun it again and move the arm.",
+                  file=sys.stderr)
+            return 1
 
         RANGES_PATH.parent.mkdir(parents=True, exist_ok=True)
         RANGES_PATH.write_text(json.dumps(
@@ -424,13 +471,11 @@ def ranges(args) -> int:
              "note": "hand-driven, torque off. Endpoints are where the joint "
                      "stopped feeling free, not the true mechanical stop.",
              "joints": out}, indent=2) + "\n")
-        print(f"\nwrote {RANGES_PATH}")
+        print(f"\nwrote {RANGES_PATH} ({len(out)}/{len(CAN_IDS)} joints)")
 
         if thin:
-            print(f"\n!! barely moved, so these are NOT measured: "
-                  f"{', '.join(thin)}\n"
-                  f"   Either you did not move them or they are already "
-                  f"against a stop. --move will refuse them.")
+            print(f"\n!! NOT recorded, moved under 1 deg: {', '.join(thin)}\n"
+                  f"   --move will refuse these until you sweep them.")
         return 0
     finally:
         _reporting(motors.values(), False)
