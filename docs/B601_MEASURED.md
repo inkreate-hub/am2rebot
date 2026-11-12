@@ -473,3 +473,28 @@ controller was already error-passive with a jammed TX queue, and the same motor
 replied 3/3 after `ip link set can0 down && up`.
 
 Bounce the link before trusting any silent scan.
+
+## "elbow_flex did not work" — it was parked on its limit, 2026-11-12
+
+A six-joint run came back as the elbow not responding while `shoulder_lift`
+moved fine. The follower elbow was healthy: `--scan` gave 7/7, torque 0.00,
+33 °C, no fault. The map was healthy too — 2% clip.
+
+The arm was **parked at the bottom of the elbow's mapped travel**:
+
+```
+elbow_flex   dir -1   offset 92.9   leader -92.3..92.9  ->  follower 0.0..185.2
+elbow_flex   now 0.04   first target 2.82
+```
+
+Direction `−1` means leader-up → follower-down, and the follower was already at
+0.04 against an image bottoming at 0.0. Working back from the 2.82° first
+target, the leader elbow was at ≈90.1° against its own max of 92.9 — the end
+that maps to the follower's zero. **2.8° of room one way, 182° the other.** The
+clamp was doing its job and it reads exactly like a dead joint.
+
+Every number needed to see that was already printed, spread across two tables,
+and none of it said so. Preflight now computes `room down` / `room up` per joint
+and warns when one side is under `CORNERED_DEG` (5°) while the other is not. It
+warns rather than blocks: a joint parked on its limit is not an error, it is
+where the arm happens to be standing.

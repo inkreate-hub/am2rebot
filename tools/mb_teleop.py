@@ -97,6 +97,12 @@ JOINTS: tuple[str, ...] = (
     "wrist_flex", "wrist_yaw", "wrist_roll",
 )
 
+#: How little room a joint can have on one side of its mapped travel before
+#: preflight calls it cornered. 5 deg is roughly one second of leader motion:
+#: enough that the operator would read it as "this joint does not work" rather
+#: than "this joint is at the end of its range".
+CORNERED_DEG = 5.0
+
 #: Short column headings. Truncating the real names gives `shou shou elbo wris
 #: wris wris`, and a live run showed the full-width table running off the right
 #: of the terminal with the follower block cut in half -- which is the half you
@@ -368,14 +374,48 @@ def teleop(args) -> int:
             if n not in first:
                 first[n] = start[n]["pos_deg"]
         gap = max(abs(first[n] - start[n]["pos_deg"]) for n in motors)
-        print(f"\n{'joint':<15}{'now':>9}{'first target':>14}{'gap':>9}")
-        print("-" * 47)
+        print(f"\n{'joint':<15}{'now':>9}{'first target':>14}{'gap':>9}"
+              f"{'room down':>11}{'room up':>9}")
+        print("-" * 67)
         for n in JOINTS:
             now = start[n]["pos_deg"]
+            room = ""
+            if n in maps:
+                lo, hi = maps[n].image()
+                room = f"{first[n] - lo:>11.1f}{hi - first[n]:>9.1f}"
             print(f"{n:<15}{now:>9.2f}{first[n]:>14.2f}"
-                  f"{first[n] - now:>+9.2f}"
+                  f"{first[n] - now:>+9.2f}{room}"
                   + ("" if n in maps else "   held"))
         print(f"\nlargest move to engage: {gap:.2f} deg")
+
+        # WHY THIS EXISTS -- 2026-11-12. A six-joint run came back as
+        # "elbow_flex did not work". Nothing was wrong with it: the follower
+        # elbow was parked at 0.04 deg against a mapped image bottoming out at
+        # 0.0, and its direction is -1, so the leader was being pushed the one
+        # way that had 2.8 deg of room instead of the way that had 185. Every
+        # number needed to see that was already printed above, spread across
+        # two tables, and none of it said "this joint is cornered".
+        #
+        # A joint parked on its limit is not an error -- it is where the arm
+        # happens to be standing -- so this warns and does not block.
+        cornered = []
+        for n, jm in maps.items():
+            lo, hi = jm.image()
+            down, up = first[n] - lo, hi - first[n]
+            if min(down, up) < CORNERED_DEG and max(down, up) > CORNERED_DEG:
+                cornered.append((n, "down" if down < up else "up",
+                                 min(down, up), max(down, up)))
+        if cornered:
+            print()
+            for n, way, tight, free in cornered:
+                other = "up" if way == "down" else "down"
+                print(f"!! {n} is PARKED ON ITS LIMIT -- {tight:.1f} deg of "
+                      f"room {way}, {free:.0f} deg {other}.")
+            print("!! Those joints will not move if you drive the leader the "
+                  "wrong way. They are not\n!! broken and this is not a "
+                  "calibration fault -- it is the clamp holding them at the\n"
+                  "!! end of their measured travel. Drive the leader the "
+                  "other way, or re-park the arm.")
 
         status = _direction_status(maps)
         print(f"\n{'joint':<15}{'sign':>6}  direction")
