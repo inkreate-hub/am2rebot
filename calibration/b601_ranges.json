@@ -1,6 +1,6 @@
 {
-  "recorded": "2026-11-12T13:45:40",
-  "note": "hand-driven, torque off. Endpoints are where the joint stopped feeling free, not the true mechanical stop. gripper NOT recorded: swept 2026-11-12 while disassembled, so its 434.74 deg was free motor travel, not jaw travel. Re-sweep it assembled.",
+  "recorded": "2026-11-12T13:48:34",
+  "note": "hand-driven, torque off. Endpoints are where the joint stopped feeling free, not the true mechanical stop.",
   "joints": {
     "shoulder_pan": {
       "min_deg": -61.26,
@@ -13,9 +13,9 @@
       "travel_deg": 209.14
     },
     "elbow_flex": {
-      "min_deg": -0.26,
-      "max_deg": 243.4,
-      "travel_deg": 243.66
+      "min_deg": -0.18,
+      "max_deg": 241.79,
+      "travel_deg": 241.97
     },
     "wrist_flex": {
       "min_deg": -97.21,

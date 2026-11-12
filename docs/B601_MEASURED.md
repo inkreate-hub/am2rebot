@@ -84,6 +84,40 @@ positions are snapshotted to `calibration/b601_prezero_*.txt` before every
 zeroing run, because `set_zero_position()` otherwise destroys the only record
 of the previous reference.
 
+## Travel, measured by hand 2026-11-12
+
+Torque off, joint moved by hand to both ends. Endpoints are where the joint
+stopped feeling free, not the true mechanical stop. Lives in
+`calibration/b601_ranges.json`; `--move` refuses any joint missing from it.
+
+| joint | min° | max° | travel° |
+|---|---|---|---|
+| `shoulder_pan` | −61.26 | 209.60 | 270.87 |
+| `shoulder_lift` | −0.35 | 208.79 | 209.14 |
+| `elbow_flex` | −0.18 | 241.79 | 241.97 |
+| `wrist_flex` | −97.21 | 45.44 | 142.65 |
+| `wrist_yaw` | −116.66 | 97.17 | 213.82 |
+| `wrist_roll` | −139.66 | 300.29 | 439.95 |
+| `gripper` | — | — | **not recorded** |
+
+These travels are larger than a 6-DoF arm's joints usually move, which looked
+like bad data: `lo`/`hi` is a bare min/max with no outlier rejection, so one
+corrupt frame widens a range permanently and nothing ever narrows it. It is
+not bad data. `elbow_flex` was swept twice, ten minutes apart, and came back
+241.97° against 243.66° — 0.7% apart, with the negative stop reproducing to
+0.08°. The numbers are real.
+
+`shoulder_lift` and `elbow_flex` both run from ≈0 to positive only. That is
+the same stop `elbow_flex` found at 58.7 N·m on the morning of 2026-11-12,
+from a parked pose that had 1.4° of negative travel left.
+
+**The gripper is deliberately absent.** It swept 434.74° (−333.97 → +100.77)
+while disassembled, so that figure is the motor turning freely, not the jaw.
+Re-sweep it assembled before trusting any gripper target — a missing range
+only ever costs a refusal, a wide wrong one costs hardware. Note that the
+`note:` field in the JSON cannot carry this warning: `_write_ranges`
+regenerates it from a constant on every sweep.
+
 ## Diagnostics that lie
 
 **An ERROR-PASSIVE link reports a healthy bus as dead.** A scan returned 0/7
