@@ -97,6 +97,15 @@ JOINTS: tuple[str, ...] = (
     "wrist_flex", "wrist_yaw", "wrist_roll",
 )
 
+#: Short column headings. Truncating the real names gives `shou shou elbo wris
+#: wris wris`, and a live run showed the full-width table running off the right
+#: of the terminal with the follower block cut in half -- which is the half you
+#: are actually watching.
+ABBREV: dict[str, str] = {
+    "shoulder_pan": "pan", "shoulder_lift": "lift", "elbow_flex": "elbow",
+    "wrist_flex": "wflex", "wrist_yaw": "wyaw", "wrist_roll": "wroll",
+}
+
 
 class JointMap:
     """One joint's leader -> follower conversion, fitted from measured travel.
@@ -348,7 +357,14 @@ def teleop(args) -> int:
             mb._reporting(motors.values(), False)
         if ctrl is not None:
             mb._shutdown(ctrl)
-        leader.disconnect()
+        try:
+            leader.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            # If the leader dropped off USB, disconnect() fails too -- it tries
+            # to write Torque_Enable to a device that is no longer there. Let
+            # that mask the real error and the operator reads a traceback about
+            # the cleanup instead of about what actually went wrong.
+            print(f"\nleader did not close cleanly: {exc}", file=sys.stderr)
         print("disconnected.")
 
 
@@ -356,22 +372,32 @@ def _dry_loop(leader, maps: dict[str, JointMap], args) -> int:
     """Leader only. Prints what the follower would be told, and never sends it."""
     period = 1.0 / max(1.0, args.fps)
     names = list(maps)
-    print(f"\n{'leader deg':^{9 * len(names)}} | "
-          f"{'follower target deg':^{9 * len(names)}}")
-    print("".join(f"{n[:8]:>9}" for n in names) + " | "
-          + "".join(f"{n[:8]:>9}" for n in names))
-    print("-" * (19 * len(names) + 3))
+    w = 7 * len(names)
+    print(f"\n{'leader deg':^{w}} | {'follower target deg':^{w}}")
+    print("".join(f"{ABBREV[n]:>7}" for n in names) + " | "
+          + "".join(f"{ABBREV[n]:>7}" for n in names))
+    print("-" * (2 * w + 3))
     deadline = (time.monotonic() + args.seconds
                 if args.seconds > 0 else float("inf"))
     n = 0
+    clamped: set[str] = set()
     try:
         while time.monotonic() < deadline:
-            action = leader.get_action()
+            try:
+                action = leader.get_action()
+            except Exception as exc:  # noqa: BLE001
+                print(f"\n\nLEADER STOPPED ANSWERING after {n} frames: {exc}")
+                print(_leader_lost_advice(args))
+                return 1
             lead = {j: action[f"{j}.pos"] for j in names}
-            targ = {j: maps[j].apply(lead[j]) for j in names}
+            targ = {}
+            for j in names:
+                targ[j] = maps[j].apply(lead[j])
+                if abs(maps[j].raw(lead[j]) - targ[j]) > 1e-6:
+                    clamped.add(j)
             if n % 5 == 0:
-                line = ("".join(f"{lead[j]:>9.1f}" for j in names) + " | "
-                        + "".join(f"{targ[j]:>9.1f}" for j in names))
+                line = ("".join(f"{lead[j]:>7.1f}" for j in names) + " | "
+                        + "".join(f"{targ[j]:>7.1f}" for j in names))
                 if sys.stdout.isatty():
                     sys.stdout.write(f"\r\033[2K{line}")
                     sys.stdout.flush()
@@ -382,7 +408,63 @@ def _dry_loop(leader, maps: dict[str, JointMap], args) -> int:
     except KeyboardInterrupt:
         pass
     print(f"\n\n{n} frames read. Nothing was sent to the follower.")
+    if clamped:
+        print(f"hit a travel limit while you were moving: "
+              f"{', '.join(sorted(clamped))}\n"
+              f"That is the clamp working. It means the leader can ask for "
+              f"more than the follower has.")
     return 0
+
+
+def _leader_lost_advice(args) -> str:
+    return (
+        f"\nThe leader's USB adapter has re-enumerated several times on this\n"
+        f"machine. Check whether {args.leader_port} came back with a new\n"
+        f"timestamp -- `ls -l {args.leader_port}` -- and if so just run this\n"
+        f"again. Nothing is wrong with the arm or the calibration; the\n"
+        f"calibration is keyed by --leader-id, not by port, so a renumbered\n"
+        f"port does not invalidate it.")
+
+
+def _freeze(ctrl, motors, args, hold: dict[str, float]) -> int:
+    """Hold the arm exactly where it is for `--hold-on-fault` seconds.
+
+    The caller's `finally` will then disable torque, so this buys the operator
+    a bounded, announced window to get a hand under the arm rather than having
+    it go limp the instant something upstream fails. The guards still run: if
+    the arm is driving into something, holding it there is not safer than
+    releasing it, and the abort wins.
+
+    It is a window, not a solution. Lowering an extended arm under control is
+    still unbuilt, and this does not do it.
+    """
+    secs = max(0.0, args.hold_on_fault)
+    if secs <= 0:
+        print("--hold-on-fault 0: releasing torque now.")
+        return 1
+    print(f"\n!! HOLDING POSITION FOR {secs:.0f} SECONDS, THEN TORQUE DROPS.")
+    print("!! TAKE THE WEIGHT OF THE ARM NOW, or cut the DC switch.\n")
+    end = time.monotonic() + secs
+    period = 1.0 / max(1.0, args.stream_hz)
+    while time.monotonic() < end:
+        step = time.monotonic()
+        mb._command_all(motors, args, hold)
+        s = mb._sample_all(ctrl, motors)
+        left = end - time.monotonic()
+        if sys.stdout.isatty():
+            tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
+            sys.stdout.write(f"\r\033[2Kholding, {left:>4.1f} s left, "
+                             f"peak torque {tq:>6.2f} N.m")
+            sys.stdout.flush()
+        if mb._guard(ctrl, motors, args, hold, sampled=s):
+            return 1
+        # Pace it. `_command_all` with no hold sends one pass and returns, so
+        # without this the only thing limiting the rate is however long
+        # `_sample_all` happens to take -- an implementation detail, not a
+        # guarantee, and the failure mode is flooding the CAN bus.
+        time.sleep(max(0.0, period - (time.monotonic() - step)))
+    print("\nhold expired.")
+    return 1
 
 
 def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
@@ -392,9 +474,9 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
     names = list(maps)
     deadline = (time.monotonic() + args.seconds
                 if args.seconds > 0 else float("inf"))
-    print("".join(f"{n[:7]:>9}" for n in names)
+    print("".join(f"{ABBREV[n]:>8}" for n in names)
           + f"{'maxerr':>9}{'maxtq':>8}{'maxT':>6}{'clamp':>7}")
-    print("-" * (9 * len(names) + 30))
+    print("-" * (8 * len(names) + 30))
 
     worst_err = worst_tq = worst_temp = 0.0
     clamped = 0
@@ -402,7 +484,24 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
     t0 = time.monotonic()
     due = t0
     while time.monotonic() < deadline:
-        action = leader.get_action()
+        try:
+            action = leader.get_action()
+        except Exception as exc:  # noqa: BLE001
+            # OBSERVED, not hypothetical: the leader's USB adapter dropped out
+            # mid-run on 2026-11-12 and sync_read raised for all seven ids.
+            #
+            # Letting that propagate would unwind straight into the `finally`
+            # and disable() every motor at once, which is the worst possible
+            # response while the arm is holding itself up -- it drops torque on
+            # six joints simultaneously and the arm falls. The leader going
+            # quiet says nothing at all about the follower, which is still
+            # answering and still tracking its last target perfectly well.
+            #
+            # So freeze: keep streaming the target the arm is already at, under
+            # the same guards, and give the operator time to take the weight.
+            print(f"\n\nLEADER STOPPED ANSWERING: {exc}")
+            print(_leader_lost_advice(args))
+            return _freeze(ctrl, motors, args, hold)
         for n in names:
             want = maps[n].apply(action[f"{n}.pos"])
             if abs(maps[n].raw(action[f"{n}.pos"]) - want) > 1e-6:
@@ -478,6 +577,10 @@ def main() -> int:
                    help="refuse to start if any joint must move further")
     p.add_argument("--max-step-deg", type=float, default=1.0,
                    help="max degrees any joint may move per control step")
+    p.add_argument("--hold-on-fault", type=float, default=5.0, metavar="SEC",
+                   help="if the leader stops answering, hold the arm where it "
+                        "is for this long before dropping torque, so you can "
+                        "get a hand under it. 0 releases immediately.")
     p.add_argument("--fps", type=float, default=20.0)
     p.add_argument("--seconds", type=float, default=0.0, help="0 = until Ctrl-C")
     p.add_argument("--vlim-dps", type=float, default=30.0)
