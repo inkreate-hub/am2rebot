@@ -69,9 +69,11 @@ See docs/B601_BRINGUP.md for the full staged plan and the gate on each stage.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
+from pathlib import Path
 
 #: CAN id per joint, 1..7, from Seeed's B601-RS wiki. Same table as rs_probe.py.
 CAN_IDS: dict[str, int] = {
@@ -344,6 +346,106 @@ def scan(args) -> int:
         _shutdown(ctrl)
 
 
+#: Where `--ranges` writes and `--move` reads. Tracked in git: the travel of
+#: this arm is a hardware fact, and the whole point is that it survives the
+#: session that measured it.
+RANGES_PATH = Path(__file__).resolve().parent.parent / "calibration" \
+    / "b601_ranges.json"
+
+#: Keep commanded motion this far inside measured travel. The measurement is
+#: hand-driven, so its endpoints are wherever the joint stopped feeling free --
+#: not the true mechanical stop, which is a little further and much harder.
+RANGE_MARGIN_DEG = 3.0
+
+
+def ranges(args) -> int:
+    """Record each joint's travel BY HAND. Never enables torque.
+
+    This is the gate that was skipped on 2026-11-12, and skipping it cost
+    `elbow_flex` 58.7 N.m into a hard stop. From the parked pose that joint had
+    1.4 degrees of negative travel; it was commanded 5.
+
+    The measurement costs nothing and risks nothing: torque stays off, you move
+    the arm, and the encoders report where it went. Run it, move every joint
+    slowly through its full comfortable travel in both directions, Ctrl-C.
+
+        python tools/mb_bringup.py --ranges
+
+    What comes out is a floor under `--move`, which afterwards refuses to plan
+    a target outside measured travel.
+    """
+    mb, ctrl, motors = _open(args)
+    try:
+        _reporting(motors.values(), True)
+        time.sleep(0.3)
+        print("TORQUE IS OFF AND STAYS OFF. Move each joint by hand, slowly, "
+              "through its full travel both ways.\nCtrl-C when done.\n")
+
+        lo: dict[str, float] = {}
+        hi: dict[str, float] = {}
+        try:
+            while True:
+                for name in CAN_IDS:
+                    s = _state_dict(_poll(motors[name], 1, ctrl))
+                    if "pos_deg" not in s:
+                        continue
+                    p = s["pos_deg"]
+                    lo[name] = min(lo.get(name, p), p)
+                    hi[name] = max(hi.get(name, p), p)
+                line = "  ".join(
+                    f"{n[:9]}:{lo.get(n, float('nan')):+7.1f}"
+                    f"/{hi.get(n, float('nan')):+7.1f}" for n in CAN_IDS)
+                print(f"\r{line}", end="", flush=True)
+        except KeyboardInterrupt:
+            print("\n")
+
+        if not lo:
+            print("Nothing was recorded.", file=sys.stderr)
+            return 1
+
+        print(f"{'joint':<15}{'min':>9}{'max':>9}{'travel':>9}")
+        print("-" * 42)
+        out = {}
+        thin = []
+        for name in CAN_IDS:
+            if name not in lo:
+                continue
+            span = hi[name] - lo[name]
+            out[name] = {"min_deg": round(lo[name], 2),
+                         "max_deg": round(hi[name], 2),
+                         "travel_deg": round(span, 2)}
+            print(f"{name:<15}{lo[name]:>9.2f}{hi[name]:>9.2f}{span:>9.2f}")
+            if span < 2 * RANGE_MARGIN_DEG:
+                thin.append(name)
+
+        RANGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RANGES_PATH.write_text(json.dumps(
+            {"recorded": time.strftime("%Y-%m-%dT%H:%M:%S"),
+             "note": "hand-driven, torque off. Endpoints are where the joint "
+                     "stopped feeling free, not the true mechanical stop.",
+             "joints": out}, indent=2) + "\n")
+        print(f"\nwrote {RANGES_PATH}")
+
+        if thin:
+            print(f"\n!! barely moved, so these are NOT measured: "
+                  f"{', '.join(thin)}\n"
+                  f"   Either you did not move them or they are already "
+                  f"against a stop. --move will refuse them.")
+        return 0
+    finally:
+        _reporting(motors.values(), False)
+        _shutdown(ctrl)
+
+
+def _load_ranges() -> dict[str, dict[str, float]]:
+    if not RANGES_PATH.exists():
+        return {}
+    try:
+        return json.loads(RANGES_PATH.read_text()).get("joints", {})
+    except (OSError, ValueError):
+        return {}
+
+
 def clear_faults(args) -> int:
     """Clear latched faults on all seven. Enables no torque, commands no move.
 
@@ -454,6 +556,41 @@ def move_one(args) -> int:
         rated = RATED_TORQUE_NM[model]
         tq_ceiling = (args.max_torque if args.max_torque is not None
                       else rated * STALL_TORQUE_FRAC)
+        # MEASURED TRAVEL IS A HARD FLOOR UNDER THIS COMMAND.
+        # On 2026-11-12 this function happily planned -5 deg into a joint with
+        # 1.4 deg of negative travel, and the motor spent 58.7 N.m discovering
+        # the difference. The amplitude is the caller's guess; the ranges file
+        # is a measurement. The measurement wins.
+        rng = _load_ranges().get(name)
+        if rng is None and not args.skip_range_check:
+            print(f"\nREFUSING: no recorded travel for {name}.\n"
+                  f"Record it first -- torque stays off, it cannot hurt "
+                  f"anything:\n"
+                  f"    python tools/mb_bringup.py --ranges\n"
+                  f"Override with --skip-range-check only if you have checked "
+                  f"the travel by hand.", file=sys.stderr)
+            return 2
+        if rng is not None:
+            room_up = rng["max_deg"] - RANGE_MARGIN_DEG - home
+            room_dn = home - (rng["min_deg"] + RANGE_MARGIN_DEG)
+            room = min(room_up, room_dn)
+            if room < args.amplitude:
+                if room < 0.5:
+                    print(f"\nREFUSING: {name} is at {home:+.2f} deg with "
+                          f"measured travel {rng['min_deg']:+.1f}..."
+                          f"{rng['max_deg']:+.1f}.\n"
+                          f"There is {room:+.2f} deg of room inside a "
+                          f"{RANGE_MARGIN_DEG:.0f} deg margin -- it is "
+                          f"already at a stop.\nMove the arm somewhere with "
+                          f"room before energising this joint.",
+                          file=sys.stderr)
+                    return 2
+                print(f"!! clamping amplitude {args.amplitude:.1f} -> "
+                      f"{room:.1f} deg: measured travel "
+                      f"{rng['min_deg']:+.1f}...{rng['max_deg']:+.1f}, "
+                      f"home {home:+.2f}, {RANGE_MARGIN_DEG:.0f} deg margin.")
+                args.amplitude = room
+
         plan = _plan(home, args.amplitude, args.cycles)
         mode_name = {MODE_MIT: "MIT (no motor-side limits!)",
                      MODE_CSP: "CSP", MODE_POS_VEL: "POS_VEL profile"}[
@@ -790,6 +927,8 @@ def main() -> int:
                         help="apply torque to ONE joint")
     action.add_argument("--clear-faults", action="store_true",
                         help="clear latched faults on all 7; no torque")
+    action.add_argument("--ranges", action="store_true",
+                        help="record travel by hand; torque stays OFF")
 
     p.add_argument("--joint", choices=sorted(CAN_IDS))
     p.add_argument("--amplitude", type=float, default=5.0,
@@ -811,6 +950,8 @@ def main() -> int:
                         "joint's model (rs-06 18.0, rs-00 7.0)")
     p.add_argument("--max-temp", type=float, default=STALL_TEMP_C,
                    help="degC abort ceiling")
+    p.add_argument("--skip-range-check", action="store_true",
+                   help="energise a joint whose travel was never recorded")
     p.add_argument("--cycles", type=int, default=2)
     p.add_argument("--sweep-min", type=int, default=1)
     p.add_argument("--sweep-max", type=int, default=127)
@@ -836,6 +977,8 @@ def main() -> int:
         return zero(args)
     if args.clear_faults:
         return clear_faults(args)
+    if args.ranges:
+        return ranges(args)
     if args.move:
         if not args.joint:
             p.error("--move needs --joint")
