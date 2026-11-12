@@ -307,8 +307,36 @@ Guards do not re-run during that hold. They have just fired; re-running them
 would abort the abort handler on its first pass and release instantly, which is
 the exact behaviour it exists to prevent.
 
-**It is still a bounded window, not a controlled descent.** Lowering an extended
-arm to the bench under power remains unbuilt.
+### The window was the wrong shape — freeze, don't count down
+
+The first version held for 5 s and then released. On the next run that window
+expired while the arm was fully extended and **it fell anyway**. Five seconds is
+not enough to read a warning and get a hand under 10 kg, and no fixed number is
+— a clock knows nothing about the arm, so picking a bigger one moves the fall
+rather than preventing it.
+
+**Heat is the right thing to key on, because heat is the only reason holding is
+not free.** A motor standing still under load dissipates that load continuously:
+40 °C holding 15.34 N·m in the run that fell, 62 °C in the morning stall.
+
+`--hold-on-fault` now defaults to **−1**: hold indefinitely, ending on whichever
+comes first —
+
+| ends on | behaviour |
+|---|---|
+| `--hold-max-temp` (50 °C) | announced 5° out, so the end is visible coming |
+| Ctrl-C | operator has the weight |
+| nothing | a cool arm holds all day |
+
+A positive value restores the fixed window; `0` releases at once.
+
+**Ctrl-C during a normal run freezes too.** That path used to fall straight
+through to `disable()` — the same instant drop, reached by the one route the
+operator takes every single time. A second Ctrl-C releases.
+
+**Still not a controlled descent.** When the temperature limit arrives, the arm
+goes limp wherever it is. Lowering an extended arm to the bench under power
+remains unbuilt.
 
 ### Measure the envelope instead of arguing about it
 
