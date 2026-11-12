@@ -562,6 +562,20 @@ def zero(args) -> int:
             motors[name].set_zero_position()
             time.sleep(0.05)
             print(f"  {name:<15} zeroed")
+
+        # RECORDED TRAVEL LIVES IN THE OLD ZERO'S FRAME, so this just
+        # invalidated it. Stale ranges are worse than none: every min and max
+        # is now offset by however far the arm was from the old zero, and
+        # `--move` would use them to decide a 36 N.m motor has room. Keep the
+        # file for reference, but get it out from under `_load_ranges`.
+        if RANGES_PATH.exists():
+            stale = RANGES_PATH.with_suffix(
+                f".stale-{time.strftime('%Y%m%d_%H%M%S')}.json")
+            RANGES_PATH.rename(stale)
+            print(f"\n!! zeroing moved the frame the recorded travel was "
+                  f"measured in.\n   Retired it to {stale.name} -- re-run "
+                  f"--ranges before --move.")
+
         print("\nRe-run --scan: every joint should now read within a degree "
               "of 0.")
         return 0
