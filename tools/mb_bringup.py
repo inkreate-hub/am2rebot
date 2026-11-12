@@ -98,9 +98,7 @@ MOTOR_MODELS: dict[str, str] = {
     j: ("rs-06" if j in SHOULDER_JOINTS else "rs-00") for j in CAN_IDS
 }
 
-#: Rated continuous torque, N.m, from Seeed's spec. Halved for the abort
-#: ceiling below: a bounded few-degree bring-up move on an arm that is not
-#: carrying a payload has no business approaching half of rated.
+#: Rated continuous torque, N.m, from Seeed's spec.
 RATED_TORQUE_NM: dict[str, float] = {"rs-06": 36.0, "rs-00": 14.0}
 
 #: WHY THESE EXIST -- 2026-11-12, and it cost a motor 62 degC.
@@ -120,7 +118,55 @@ RATED_TORQUE_NM: dict[str, float] = {"rs-06": 36.0, "rs-00": 14.0}
 #: So torque and temperature are now watched directly. They are the two
 #: signals that move early in a stall -- torque crossed 30 N.m while the
 #: motor was still at 27 degC, a full five steps before anything got hot.
-STALL_TORQUE_FRAC = 0.5
+#:
+#: WHY THERE ARE NOW TWO CEILINGS -- 2026-11-12 evening, and it cost a fall.
+#:
+#: The single ceiling above was `rated * 0.5` and its abort message said "it is
+#: driving into something". During the first elbow teleop run `shoulder_lift`
+#: tripped it at 18.28 N.m -- 1.5% over -- while it was NOT BEING DRIVEN AT
+#: ALL. It was in the held set, target unchanged, tracking error +0.00. The
+#: operator had extended `elbow_flex` to 143.7 deg, which swung the forearm and
+#: wrist mass out from the base, and the shoulder's gravity moment rose until
+#: standing still cost 18.28 N.m. Nothing was obstructed. The arm was holding
+#: itself up, which is its job.
+#:
+#: The premise under `* 0.5` was "a bounded few-degree bring-up move on an arm
+#: that is not carrying a payload". Teleop breaks that premise: the payload is
+#: the arm's own outstretched mass, and this geometry genuinely needs more than
+#: half of rated at the shoulder. A ceiling below the static weight of the
+#: machine is not a safety limit, it is a guarantee of nuisance aborts in
+#: exactly the poses where an abort is most expensive.
+#:
+#: So torque alone no longer decides. A STALL and a GRAVITY HOLD look identical
+#: on the torque channel and completely different everywhere else:
+#:
+#:     signal          stall (morning)        gravity hold (evening)
+#:     torque          high and rising        high and steady
+#:     position error  5.3 deg and growing    0.00 deg
+#:     velocity        ~0 against a command    tracking normally
+#:
+#: `GRAVITY_TORQUE_FRAC` is now only the threshold at which the OTHER two
+#: channels get consulted. Crossing it with a large error and no motion is a
+#: stall and aborts. Crossing it while tracking is the arm's weight and warns.
+#: `HARD_TORQUE_FRAC` aborts regardless -- nothing legitimate on an unloaded
+#: arm needs 85% of rated continuous, and the morning stall would have crossed
+#: it at step three, long before 58.7 N.m.
+GRAVITY_TORQUE_FRAC = 0.5
+HARD_TORQUE_FRAC = 0.85
+
+#: What counts as "not getting there" and "not moving", for the stall test.
+#: Teleop's rate-limited target leads the follower by a degree or so at normal
+#: speed, so 2.0 sits above the honest lag and well under the 5.3 deg the real
+#: stall reached.
+STALL_ERR_DEG = 2.0
+STALL_VEL_DPS = 2.0
+
+#: Margin over a MEASURED gravity peak when that measurement exists -- see
+#: `--gravity-map`. A pose the arm has already held is allowed 25% more before
+#: it is treated as suspicious, which covers a payload in the gripper and the
+#: difference between a slow sweep and a hand moving at speed.
+GRAVITY_MARGIN = 1.25
+
 STALL_TEMP_C = 50.0
 
 #: RobStride's default host/master id. MotorBridge's own scan tries
@@ -651,6 +697,65 @@ def _load_ranges() -> dict[str, dict[str, float]]:
         return {}
 
 
+#: Peak torque each joint was MEASURED holding, per `--gravity-map`. A property
+#: of this arm's mass and geometry, so it belongs beside the travel ranges
+#: rather than in `recordings/`.
+GRAVITY_PATH = RANGES_PATH.parent / "gravity_torque.json"
+
+
+def _load_gravity() -> dict[str, dict[str, float]]:
+    if not GRAVITY_PATH.exists():
+        return {}
+    try:
+        return json.loads(GRAVITY_PATH.read_text()).get("joints", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def _ceilings(args) -> dict[str, tuple[float, float, float]]:
+    """`(stall, warn, hard)` torque ceiling per joint, N.m.
+
+    Three numbers because they answer three different questions, and an early
+    version of this collapsed two of them and created a blind spot:
+
+    `stall` -- above this, torque accompanied by a large tracking error and no
+    motion is a stall and aborts. HALF OF RATED, FIXED. Deliberately NOT raised
+    by the gravity map: a gravity load appears with zero error by definition,
+    so a measurement of what the arm can hold says nothing whatever about what
+    is acceptable while FAILING to reach a target. Raising this with the
+    measurement is what the first version did, and a mapped shoulder then sat
+    blind to a genuine stall anywhere between 18 and 26 N.m.
+
+    `warn` -- above this, high torque is worth mentioning once. Raised to cover
+    any load this arm has actually been measured carrying, because the whole
+    point of the map is to stop narrating the machine's own weight back at the
+    operator as though it were news.
+
+    `hard` -- above this, abort, no questions, no discriminator. Nothing on an
+    unloaded arm needs 85% of rated continuous. Never raised by anything: a
+    measurement claiming a joint needs that much to stand still is evidence
+    something is wrong with the arm, not a licence to allow it.
+
+    An explicit `--max-torque` overrides all three. The operator has said a
+    number; second-guessing it with a hidden higher one would be worse than
+    obeying it.
+    """
+    measured = _load_gravity()
+    out: dict[str, tuple[float, float, float]] = {}
+    for name, model in MOTOR_MODELS.items():
+        rated = RATED_TORQUE_NM[model]
+        hard = rated * HARD_TORQUE_FRAC
+        stall = rated * GRAVITY_TORQUE_FRAC
+        warn = stall
+        peak = measured.get(name, {}).get("peak_nm")
+        if peak is not None:
+            warn = max(warn, abs(float(peak)) * GRAVITY_MARGIN)
+        if args.max_torque is not None:
+            stall = warn = hard = args.max_torque
+        out[name] = (min(stall, hard), min(warn, hard), hard)
+    return out
+
+
 def clear_faults(args) -> int:
     """Clear latched faults on all seven. Enables no torque, commands no move.
 
@@ -773,8 +878,11 @@ def move_one(args) -> int:
         home = state["pos_deg"]
         model = MOTOR_MODELS[name]
         rated = RATED_TORQUE_NM[model]
-        tq_ceiling = (args.max_torque if args.max_torque is not None
-                      else rated * STALL_TORQUE_FRAC)
+        # The warn ceiling, not the hard one: `--move` is a bounded few-degree
+        # step on one joint, so anything above the gravity envelope here really
+        # is suspicious. It tracks `--gravity-map` so a pose the arm has been
+        # measured holding does not read as a stall.
+        tq_ceiling = _ceilings(args)[name][1]
         # MEASURED TRAVEL IS A HARD FLOOR UNDER THIS COMMAND.
         # On 2026-11-12 this function happily planned -5 deg into a joint with
         # 1.4 deg of negative travel, and the motor spent 58.7 N.m discovering
@@ -1106,6 +1214,7 @@ def replay(args) -> int:
     mb, ctrl, motors = _open(args)
     motors = {n: m for n, m in motors.items() if n in playable}
     engaged = False
+    warned: set[str] = set()
     try:
         _reporting(motors.values(), True)
         time.sleep(0.3)
@@ -1162,9 +1271,8 @@ def replay(args) -> int:
                                    min(args.max_step_deg, d))
                     step_left = True
             _command_all(motors, args, hold, hold=args.settle)
-            rc = _guard(ctrl, motors, args, hold)
-            if rc:
-                return rc
+            if _guard(ctrl, motors, args, hold, warned=warned):
+                return _settle_and_release(ctrl, motors, args, engaged)
             if not step_left:
                 break
         print("at frame 0.\n")
@@ -1198,9 +1306,8 @@ def replay(args) -> int:
                     "".join(f"{row[n]:>9.1f}" for n in playable) +
                     f"{err:>9.2f}{tq:>8.2f}{tp:>6.0f}")
                 sys.stdout.flush()
-            rc = _guard(ctrl, motors, args, row, sampled=s)
-            if rc:
-                return rc
+            if _guard(ctrl, motors, args, row, sampled=s, warned=warned):
+                return _settle_and_release(ctrl, motors, args, engaged)
 
         print(f"\n\nreplayed {len(track)} frames in "
               f"{time.monotonic() - t_start:.1f} s")
@@ -1226,40 +1333,351 @@ def replay(args) -> int:
         _shutdown(ctrl)
 
 
+def gravity_map(args) -> int:
+    """Walk ONE joint to a chosen angle and record what every joint carried.
+
+    This exists because the torque ceilings were a guess and the guess was
+    wrong in the expensive direction. `rated * 0.5` is a number from a
+    datasheet; what the arm actually needs to hold itself up is a property of
+    its mass and geometry, and the only way to know it is to put the arm in the
+    pose and read the torque off the motors that are holding it.
+
+    The sweep is deliberately boring. It steps the chosen joint toward
+    `--to-deg` in `--max-step-deg` increments, dwells `--settle` at each one so
+    the reading is static rather than a transient, and samples all seven. Every
+    joint's peak |torque| over the whole walk goes into the file -- not just
+    the joint being moved, because the joint being moved is usually NOT the one
+    that ends up loaded. Extending the elbow is what loads the shoulder.
+
+    Guarded throughout, and an abort goes through `_settle_and_release` like
+    everything else. The target is bounded by the measured travel the same way
+    `--move` is: this walks much further than `--move` does, so planning into a
+    hard stop would be correspondingly worse.
+    """
+    name = args.joint
+    if args.to_deg is None:
+        print("--gravity-map needs --to-deg: the angle to walk this joint to.\n"
+              "Pick a pose that LOADS the arm -- an extended elbow, not a "
+              "folded one -- and stay inside the measured travel.",
+              file=sys.stderr)
+        return 2
+
+    rng = _load_ranges().get(name)
+    if rng is None and not args.skip_range_check:
+        print(f"\nREFUSING: no recorded travel for {name}.\n"
+              f"    python tools/mb_bringup.py --ranges --joint {name}",
+              file=sys.stderr)
+        return 1
+    if rng is not None:
+        lo, hi = rng["min_deg"], rng["max_deg"]
+        if not lo <= args.to_deg <= hi:
+            print(f"\nREFUSING: --to-deg {args.to_deg:.1f} is outside {name}'s "
+                  f"measured travel {lo:.1f} .. {hi:.1f}.\n"
+                  f"The amplitude is your guess; the ranges file is a "
+                  f"measurement. The measurement wins.", file=sys.stderr)
+            return 1
+
+    mb, ctrl, motors = _open(args)
+    engaged = False
+    warned: set[str] = set()
+    try:
+        _reporting(motors.values(), True)
+        time.sleep(0.3)
+        start = _sample_all(ctrl, motors)
+        if name not in start:
+            print(f"{name} is not answering. Run --scan.", file=sys.stderr)
+            return 1
+        here = start[name]["pos_deg"]
+        steps = int(math.ceil(abs(args.to_deg - here) / max(0.01,
+                                                            args.max_step_deg)))
+        print(f"\n{name}: {here:.2f} -> {args.to_deg:.2f} deg "
+              f"({steps} steps of {args.max_step_deg:.2f}), all other joints "
+              f"held.")
+        print("Peak torque on EVERY joint is recorded, not just this one.")
+        if args.dry_run:
+            print("\n--dry-run: nothing enabled.")
+            return 0
+
+        print("\n!! ALL 7 JOINTS GO UNDER POWER and one of them travels a "
+              "long way.\n!! Keep a hand on the DC switch.")
+        if input("type 'gravity' to continue: ").strip() != "gravity":
+            print("aborted.")
+            return 1
+
+        for m in motors.values():
+            m.ensure_mode(_mode_of(args), args.mode_timeout_ms)
+        hold = {n: st["pos_deg"] for n, st in start.items() if n in motors}
+        _command_all(motors, args, hold)
+        for m in motors.values():
+            m.enable()
+        engaged = True
+        _command_all(motors, args, hold, hold=0.4)
+        print("\nenabled, holding.\n")
+
+        order = [n for n in CAN_IDS if n in motors]
+        print(f"{'target':>8}" + "".join(f"{ABBREV_TQ.get(n, n[:5]):>8}"
+                                         for n in order))
+        print("-" * (8 + 8 * len(order)))
+        peak: dict[str, float] = {n: 0.0 for n in order}
+        peak_at: dict[str, float] = {n: here for n in order}
+
+        for _ in range(steps + 1):
+            d = args.to_deg - hold[name]
+            hold[name] += max(-args.max_step_deg,
+                              min(args.max_step_deg, d))
+            _command_all(motors, args, hold, hold=args.settle)
+            s = _sample_all(ctrl, motors)
+            for n in order:
+                tq = abs(s.get(n, {}).get("torque", 0.0))
+                if math.isfinite(tq) and tq > peak[n]:
+                    peak[n] = tq
+                    peak_at[n] = hold[name]
+            print(f"{hold[name]:>8.1f}"
+                  + "".join(f"{s.get(n, {}).get('torque', float('nan')):>8.2f}"
+                            for n in order))
+            if _guard(ctrl, motors, args, hold, sampled=s, warned=warned):
+                # Everything measured up to the abort is still true, and the
+                # pose that caused it is the most informative sample in the
+                # run. Write before releasing, not after.
+                _write_gravity(peak, peak_at, order, name, hold[name])
+                print(f"\npartial map written to {GRAVITY_PATH}")
+                return _settle_and_release(ctrl, motors, args, engaged)
+            if abs(args.to_deg - hold[name]) < 1e-3:
+                break
+
+        _write_gravity(peak, peak_at, order, name, hold[name])
+        print(f"\n{'joint':<15}{'peak N.m':>10}{'% rated':>9}"
+              f"{'at ' + name:>18}")
+        print("-" * 52)
+        for n in order:
+            rated = RATED_TORQUE_NM[MOTOR_MODELS[n]]
+            print(f"{n:<15}{peak[n]:>10.2f}{peak[n] / rated * 100:>8.0f}%"
+                  f"{peak_at[n]:>18.1f}")
+        print(f"\nwritten to {GRAVITY_PATH}")
+        print("The guard now reads this file: a joint is allowed "
+              f"{GRAVITY_MARGIN:.2f}x its measured peak before\n"
+              "high torque counts as suspicious, capped at "
+              f"{HARD_TORQUE_FRAC:.0%} of rated.")
+        print("\nThis maps ONE pose family. Repeat it for the poses you "
+              "actually teleop through --\nthe file keeps the highest peak "
+              "seen per joint across runs.")
+        return 0
+    except KeyboardInterrupt:
+        print("\n\ninterrupted.")
+        return _settle_and_release(ctrl, motors, args, engaged)
+    finally:
+        if engaged:
+            for n, m in motors.items():
+                try:
+                    m.disable()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"\n!! could not disable {n}: {exc}\n"
+                          f"!! CUT THE DC SWITCH.", file=sys.stderr)
+            print("torque disabled.")
+        _reporting(motors.values(), False)
+        _shutdown(ctrl)
+
+
+#: Short headings for the gravity table; the full names do not fit seven wide.
+ABBREV_TQ: dict[str, str] = {
+    "shoulder_pan": "pan", "shoulder_lift": "lift", "elbow_flex": "elbow",
+    "wrist_flex": "wflex", "wrist_yaw": "wyaw", "wrist_roll": "wroll",
+    "gripper": "grip",
+}
+
+
+def _write_gravity(peak: dict[str, float], peak_at: dict[str, float],
+                   scope: list[str], swept: str, reached: float) -> None:
+    """Merge this run's peaks into the gravity file, keeping the HIGHEST.
+
+    Merging rather than replacing, and keeping the maximum, because one sweep
+    only visits one family of poses. A run that extends the elbow loads the
+    shoulder; a run that pans does not. Overwriting would let the second run
+    silently lower a ceiling the first run earned, and a ceiling that drops
+    when you measure more is worse than no ceiling at all.
+
+    This is the opposite convention to `_write_ranges`, which rewrites its
+    scope outright. The difference is what a stale value costs: a leftover wide
+    TRAVEL lets `--move` plan into a stop, so stale travel must be dropped. A
+    leftover high TORQUE peak only makes the guard more permissive in a pose
+    the arm has genuinely held before, and it is bounded by the hard ceiling.
+    """
+    out = _load_gravity()
+    for n in scope:
+        prev = out.get(n, {})
+        if float(prev.get("peak_nm", 0.0)) >= peak[n]:
+            continue
+        out[n] = {"peak_nm": round(peak[n], 2),
+                  "at_deg": round(peak_at[n], 2),
+                  "swept": swept,
+                  "recorded": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    out = {n: out[n] for n in CAN_IDS if n in out}
+    GRAVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GRAVITY_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(
+        {"recorded": time.strftime("%Y-%m-%dT%H:%M:%S"),
+         "note": "peak |torque| each joint was measured holding during a slow "
+                 "stepped sweep, under power. Highest value seen across runs. "
+                 "'at_deg' is the swept joint's angle at that peak.",
+         "last_sweep": {"joint": swept, "reached_deg": round(reached, 2)},
+         "joints": out}, indent=2) + "\n")
+    tmp.replace(GRAVITY_PATH)
+
+
 def _guard(ctrl, motors, args, targets: dict[str, float],
-           sampled: dict | None = None) -> int:
+           sampled: dict | None = None,
+           warned: set[str] | None = None) -> int:
     """Torque / temperature / tracking check across every driven joint.
 
     Returns non-zero to abort. Shared by the approach and the playback so a
     joint cannot be protected during one and bare during the other.
+
+    High torque on its own is NOT an abort. See the two-ceiling note at the top
+    of this file: an arm holding itself up at full extension and an arm driving
+    into a hard stop read the same on the torque channel, and only the tracking
+    error and the velocity separate them. Getting that wrong in either
+    direction is expensive -- ignoring a stall cooked a motor to 62 degC in the
+    morning, and aborting on a gravity load dropped an extended arm in the
+    evening of the same day.
+
+    `warned` is a caller-owned set of joints that have already had their
+    gravity-load notice printed. Without it a joint parked above its warn
+    ceiling reprints every frame, at 20 Hz, over the live table.
     """
     s = sampled if sampled is not None else _sample_all(ctrl, motors)
+    ceilings = _ceilings(args)
     for name, st in s.items():
         if name not in targets:
             continue
         model = MOTOR_MODELS[name]
-        ceiling = (args.max_torque if args.max_torque is not None
-                   else RATED_TORQUE_NM[model] * STALL_TORQUE_FRAC)
+        stall_nm, warn_nm, hard_nm = ceilings[name]
+        rated = RATED_TORQUE_NM[model]
         tq = st.get("torque", 0.0)
         tp = st.get("temp", 0.0)
         pos = st.get("pos_deg", float("nan"))
-        if math.isfinite(tq) and abs(tq) > ceiling:
-            print(f"\n\nABORT: {name} at {tq:+.2f} N.m exceeds {ceiling:.1f} "
-                  f"({model}, rated {RATED_TORQUE_NM[model]:.0f}).\n"
-                  f"It is driving into something -- a stop, the bench, or "
-                  f"another link. Do NOT raise the ceiling to get past it.")
+        vel = st.get("vel_dps", float("nan"))
+        err = abs(pos - targets[name]) if math.isfinite(pos) else 0.0
+
+        if math.isfinite(tq) and abs(tq) > hard_nm:
+            print(f"\n\nABORT: {name} at {tq:+.2f} N.m is past the hard "
+                  f"ceiling {hard_nm:.1f} ({model}, rated {rated:.0f}).\n"
+                  f"That is {abs(tq) / rated * 100:.0f}% of rated continuous. "
+                  f"No pose of an unloaded arm needs that.\n"
+                  f"Do NOT raise --max-torque to get past it.")
             return 1
+
+        # Stalled, or holding itself up? A stall is commanded somewhere it is
+        # not getting to, and not moving. Both terms matter: a joint with a
+        # large error that is still travelling is catching up, and a joint with
+        # no error is not being asked for anything it is failing to do, however
+        # hard it is working to stay there.
+        if (math.isfinite(tq) and abs(tq) > stall_nm
+                and err > STALL_ERR_DEG
+                and math.isfinite(vel) and abs(vel) < STALL_VEL_DPS):
+            print(f"\n\nABORT: {name} is STALLED -- {tq:+.2f} N.m, "
+                  f"{err:.2f} deg from target, moving {vel:+.1f} deg/s.\n"
+                  f"High torque, not getting there, not moving. It is "
+                  f"driving into something: a stop, the bench,\n"
+                  f"or another link. Do NOT raise --max-torque to get "
+                  f"past it.")
+            return 1
+
+        if (math.isfinite(tq) and abs(tq) > warn_nm
+                and warned is not None and name not in warned):
+            warned.add(name)
+            print(f"\n\n!! {name} is carrying {tq:+.2f} N.m, over the "
+                  f"{warn_nm:.1f} warn ceiling, but tracking to "
+                  f"{err:.2f} deg.\n"
+                  f"!! Reading that as the arm's own weight, not a stall. "
+                  f"Hard ceiling is {hard_nm:.1f}.\n"
+                  f"!! Measure the real envelope with --gravity-map so "
+                  f"this stops being an inference.\n")
+
         if math.isfinite(tp) and tp > args.max_temp:
             print(f"\n\nABORT: {name} at {tp:.0f} degC exceeds --max-temp "
                   f"{args.max_temp:.0f}. Let it cool.")
             return 1
-        if math.isfinite(pos) and abs(pos - targets[name]) > args.abort_deg:
+        if math.isfinite(pos) and err > args.abort_deg:
             print(f"\n\nABORT: {name} is {pos - targets[name]:+.2f} deg from "
                   f"target, past --abort-deg {args.abort_deg:.0f}.\n"
                   f"Either it is obstructed, or the 48 V rail dropped and it "
                   f"lost torque. Check --scan.")
             return 1
     return 0
+
+
+def _settle_and_release(ctrl, motors, args, engaged: bool = True) -> int:
+    """Stop pushing, hold the arm where it is, then release on a countdown.
+
+    WHAT THIS REPLACES, and why it is worth the complexity: every abort path in
+    this file used to return straight into a `finally` that called `disable()`
+    on all six motors. On a folded arm that is harmless. On an arm extended at
+    143 deg it converts a warning into a fall, which is exactly what happened
+    on 2026-11-12 -- the guard was right that torque was high and its response
+    destroyed more than the condition would have.
+
+    Two things happen here, in order, and the first is the important one:
+
+    1. RE-TARGET EVERY JOINT TO WHERE IT ACTUALLY IS. If the abort was a stall,
+       the stall was caused by a commanded position the joint could not reach;
+       setting the target to the measured position removes the error, and with
+       it the torque, without removing the torque that holds the arm up. A
+       stalled joint stops pushing immediately. A gravity-loaded joint keeps
+       exactly the load it needs and no more.
+    2. Stream that for `--hold-on-fault` seconds, announced, then return and
+       let the caller's `finally` release.
+
+    The guards deliberately do NOT re-run during the hold. They just fired;
+    re-running them would abort the abort handler on its first pass and release
+    instantly, which is the behaviour this exists to prevent. The motor's own
+    protection remains the backstop, and the temperature is printed so the
+    operator can see it climbing.
+
+    It is still a bounded window, not a controlled descent. Lowering an
+    extended arm to the bench under power is unbuilt. Returns 1 always: this is
+    an abort path, and nothing it does makes the run a success.
+    """
+    if not engaged:
+        return 1
+    secs = max(0.0, getattr(args, "hold_on_fault", 0.0))
+    if secs <= 0:
+        print("--hold-on-fault 0: releasing torque now.")
+        return 1
+
+    s = _sample_all(ctrl, motors)
+    hold = {n: st["pos_deg"] for n, st in s.items()
+            if n in motors and math.isfinite(st.get("pos_deg", float("nan")))}
+    if not hold:
+        # No positions means no safe target to stream. Holding the LAST
+        # commanded target instead would be a guess about an arm we have just
+        # lost sight of, and guessing is how a joint gets driven into a stop.
+        print("\n!! could not read any position -- releasing torque NOW.\n"
+              "!! TAKE THE WEIGHT OF THE ARM.", file=sys.stderr)
+        return 1
+
+    print(f"\n!! HOLDING WHERE IT IS FOR {secs:.0f} SECONDS, THEN TORQUE "
+          f"DROPS.")
+    print("!! Targets reset to measured position -- nothing is being pushed.")
+    print("!! TAKE THE WEIGHT OF THE ARM NOW, or cut the DC switch.\n")
+    end = time.monotonic() + secs
+    period = 1.0 / max(1.0, args.stream_hz)
+    while time.monotonic() < end:
+        step = time.monotonic()
+        _command_all(motors, args, hold)
+        s = _sample_all(ctrl, motors)
+        if sys.stdout.isatty():
+            tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
+            tp = max((s[n].get("temp", 0.0) for n in s), default=0.0)
+            sys.stdout.write(
+                f"\r\033[2Kholding, {end - time.monotonic():>4.1f} s left, "
+                f"peak torque {tq:>6.2f} N.m, {tp:>3.0f} degC")
+            sys.stdout.flush()
+        # Pace it. `_command_all` with no hold sends one pass and returns, so
+        # without this the only thing limiting the rate is however long
+        # `_sample_all` happens to take.
+        time.sleep(max(0.0, period - (time.monotonic() - step)))
+    print("\nhold expired -- releasing torque.")
+    return 1
 
 
 #: Where `--record` writes and `--replay` reads. Not `calibration/`: a
@@ -1613,6 +2031,11 @@ def main() -> int:
     action.add_argument("--replay", metavar="FILE",
                         help="drive a recorded trajectory. ALL joints, "
                              "under power")
+    action.add_argument("--gravity-map", action="store_true",
+                        help="walk --joint to --to-deg and record what every "
+                             "joint carried. ALL joints under power. This is "
+                             "what sets the torque ceilings from measurement "
+                             "instead of from the datasheet")
 
     p.add_argument("--joint", choices=sorted(CAN_IDS))
     p.add_argument("--joints", metavar="A,B",
@@ -1638,10 +2061,20 @@ def main() -> int:
                    help="seconds to stream each target before measuring")
     p.add_argument("--stream-hz", type=float, default=20.0,
                    help="rate at which the target is re-sent while held")
+    p.add_argument("--to-deg", type=float, default=None,
+                   help="--gravity-map only: angle to walk --joint to. Must "
+                        "be inside its measured travel")
     p.add_argument("--abort-deg", type=float, default=15.0)
+    p.add_argument("--hold-on-fault", type=float, default=5.0,
+                   help="seconds to hold position after an abort before "
+                        "torque is released. 0 releases immediately, which "
+                        "DROPS an extended arm")
     p.add_argument("--max-torque", type=float, default=None,
-                   help="N.m abort ceiling; default is half rated for the "
-                        "joint's model (rs-06 18.0, rs-00 7.0)")
+                   help="N.m ceiling, overriding BOTH the gravity-aware warn "
+                        "ceiling and the hard one. Default warn is half rated "
+                        "(rs-06 18.0, rs-00 7.0) raised to cover anything "
+                        "--gravity-map measured; default hard is 85%% of "
+                        "rated (rs-06 30.6, rs-00 11.9)")
     p.add_argument("--max-temp", type=float, default=STALL_TEMP_C,
                    help="degC abort ceiling")
     p.add_argument("--skip-range-check", action="store_true",
@@ -1677,6 +2110,10 @@ def main() -> int:
         return record(args)
     if args.replay:
         return replay(args)
+    if args.gravity_map:
+        if not args.joint:
+            p.error("--gravity-map needs --joint")
+        return gravity_map(args)
     if args.move:
         if not args.joint:
             p.error("--move needs --joint")

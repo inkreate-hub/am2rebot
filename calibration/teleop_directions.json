@@ -1,0 +1,29 @@
+{
+  "joints": {
+    "shoulder_pan": {
+      "direction": 1,
+      "verified": "2026-11-12"
+    },
+    "shoulder_lift": {
+      "direction": 1,
+      "verified": "2026-11-12"
+    },
+    "elbow_flex": {
+      "direction": -1,
+      "verified": "2026-11-12"
+    },
+    "wrist_flex": {
+      "direction": -1,
+      "verified": "2026-11-12"
+    },
+    "wrist_yaw": {
+      "direction": -1,
+      "verified": "2026-11-12"
+    },
+    "wrist_roll": {
+      "direction": 1,
+      "verified": "2026-11-12"
+    }
+  },
+  "note": "Joints watched following the leader the correct way on the physical arm. 'direction' is the sign that was verified -- running with the opposite sign is NOT covered by this entry."
+}

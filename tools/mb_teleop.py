@@ -551,44 +551,20 @@ def _leader_lost_advice(args) -> str:
 
 
 def _freeze(ctrl, motors, args, hold: dict[str, float]) -> int:
-    """Hold the arm exactly where it is for `--hold-on-fault` seconds.
+    """Hold the arm where it is, then release. See `mb._settle_and_release`.
 
-    The caller's `finally` will then disable torque, so this buys the operator
-    a bounded, announced window to get a hand under the arm rather than having
-    it go limp the instant something upstream fails. The guards still run: if
-    the arm is driving into something, holding it there is not safer than
-    releasing it, and the abort wins.
+    This used to be its own loop, which re-ran the guards every pass and let an
+    abort cut the hold short -- reasonable when the only caller was a leader
+    dropout, wrong once the guards themselves started calling it. The shared
+    version also re-targets to the MEASURED position rather than streaming
+    `hold`, which is what makes it safe to use after a stall: the commanded
+    error that caused the stall goes away, the torque holding the arm up does
+    not.
 
-    It is a window, not a solution. Lowering an extended arm under control is
-    still unbuilt, and this does not do it.
+    `hold` is no longer read. It stays in the signature because the call sites
+    read better with the thing being held named at the call.
     """
-    secs = max(0.0, args.hold_on_fault)
-    if secs <= 0:
-        print("--hold-on-fault 0: releasing torque now.")
-        return 1
-    print(f"\n!! HOLDING POSITION FOR {secs:.0f} SECONDS, THEN TORQUE DROPS.")
-    print("!! TAKE THE WEIGHT OF THE ARM NOW, or cut the DC switch.\n")
-    end = time.monotonic() + secs
-    period = 1.0 / max(1.0, args.stream_hz)
-    while time.monotonic() < end:
-        step = time.monotonic()
-        mb._command_all(motors, args, hold)
-        s = mb._sample_all(ctrl, motors)
-        left = end - time.monotonic()
-        if sys.stdout.isatty():
-            tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
-            sys.stdout.write(f"\r\033[2Kholding, {left:>4.1f} s left, "
-                             f"peak torque {tq:>6.2f} N.m")
-            sys.stdout.flush()
-        if mb._guard(ctrl, motors, args, hold, sampled=s):
-            return 1
-        # Pace it. `_command_all` with no hold sends one pass and returns, so
-        # without this the only thing limiting the rate is however long
-        # `_sample_all` happens to take -- an implementation detail, not a
-        # guarantee, and the failure mode is flooding the CAN bus.
-        time.sleep(max(0.0, period - (time.monotonic() - step)))
-    print("\nhold expired.")
-    return 1
+    return mb._settle_and_release(ctrl, motors, args, engaged=True)
 
 
 def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
@@ -604,6 +580,10 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
 
     worst_err = worst_tq = worst_temp = 0.0
     clamped = 0
+    # Owned here, not inside the guard: a joint that is legitimately carrying
+    # the arm's weight sits above its warn ceiling for the whole session, and
+    # the notice belongs once per run rather than 20 times a second.
+    warned: set[str] = set()
     i = 0
     t0 = time.monotonic()
     due = t0
@@ -659,9 +639,13 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
                     f"\r\033[2K" + "".join(f"{hold[n]:>8.1f}" for n in names)
                     + f"{err:>9.2f}{tq:>8.2f}{tp:>6.0f}{clamped:>7}")
                 sys.stdout.flush()
-            rc = mb._guard(ctrl, motors, args, hold, sampled=s)
-            if rc:
-                return rc
+            if mb._guard(ctrl, motors, args, hold, sampled=s, warned=warned):
+                # NOT a bare `return`. Returning here unwinds into the caller's
+                # `finally`, which disables all six at once -- and on
+                # 2026-11-12 that turned a 0.28 N.m overshoot on a joint that
+                # was not even being driven into a fall from 143 deg. Stop
+                # pushing, hold, announce, then release.
+                return _freeze(ctrl, motors, args, hold)
             i += 1
             # Fixed cadence against a running deadline, not `sleep(period)`:
             # `_sample_all` alone costs ~21 ms, so sleeping a full period on
