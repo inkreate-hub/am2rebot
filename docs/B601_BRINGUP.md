@@ -13,6 +13,53 @@ limits, the joint directions, the gripper's units, and the control mode.
 
 ---
 
+## ⚠️ What hardware has since contradicted (2026-11-10)
+
+This plan was written before any motor answered. Four of its assumptions were
+tested on the arm and **three were wrong**. Read this before following anything
+below.
+
+| Stage | This doc said | Measured |
+|---|---|---|
+| 3 | shoulders are probably lerobot's `O6`, PMAX 112.5 | ❌ **PMAX is 12.57 rad for `rs-06`.** `O6` would have been 8.95× wrong |
+| 1 | extended-id traffic would mean the motors are in RobStride's private protocol | ❌ never arose — **ACK-layer analysis rules that out in one shot**, see below |
+| 1 | feedback id is either the device id or Damiao's `0x10+id` | ❌ neither: the **host id is `0xFD`** |
+| 2 | poll and the motor answers | ❌ **only with `robstride_set_active_report(True)`**. Polling alone returns nothing from a healthy motor |
+
+**The primary transport changed.** Seeed's own **MotorBridge** SDK takes the
+model as `"rs-00"` / `"rs-06"` directly, so the whole `O0..O6` naming ambiguity
+that stages 3 and 5 exist to defuse simply does not arise — the SDK owns the
+scale constant and keys it on the real part number. It also offers
+`robstride_send_pos_vel_pp(pos, vel_max, acc)`, profile position, where the
+motor clamps its own velocity *and* acceleration in firmware rather than in a
+Python loop. lerobot's `RobstrideMotorsBus` only implements MIT, a bare torque
+law with no ceiling of any kind.
+
+So **`tools/mb_bringup.py` is the live tool.** `tools/rs_probe.py` and
+`tools/rs_move_one.py` remain as the lerobot path, unused.
+
+**Where the arm actually is:** `can0` up at 1 Mbit/s classic, ERROR-ACTIVE, real
+bidirectional traffic. `shoulder_pan` moved ±3° on 2026-11-10 with a worst
+tracking error of **0.07°** — stage 5, passed, on the only motor that answers.
+**The bus is 1 of 7.** All 127 ids swept at four host ids; nothing but id 1
+exists anywhere, so the other six are not misconfigured, they are
+*electrically unreachable*. Prime suspect is the signal separation board.
+
+Also unexplained: `shoulder_pan` drifted ~11° unloaded between two runs.
+
+### The ACK argument, which is worth keeping
+
+With the arm unpowered the bus went ERROR-PASSIVE after 3 TX frames with **zero**
+bus errors — pure ACK failure. Acknowledgement happens in the data-link layer,
+below any motor protocol, so *any* powered CAN node at the right bitrate ACKs
+every well-formed frame whatever it speaks. One observation therefore ruled out
+the host-id question, the private-protocol worry below, and every software
+cause at once. It had to be power or wiring. It was power.
+`tools/can_errcheck.py` makes that distinction, on stdlib `AF_CAN` sockets with
+no `python-can` and no root.
+
+---
+
 ## Why this order
 
 Three facts drive it.
@@ -127,8 +174,18 @@ pairs each with a feedback id `0x11..0x17`. If `data[0]` is the device id, leave
 `recv_id=None`. If it is `0x10+id`, set `recv_id` accordingly or every frame is
 dropped as "Unmapped CAN frame".
 
+> **Measured 2026-11-10:** the host id is **`0xFD`**, not the device id and not
+> Damiao's `0x10+id`. Carrying lerobot's DM assumption across looks exactly like
+> a dead bus. `mb_bringup.py --host-id` defaults to `0xFD` for this reason.
+>
+> The extended-frame / private-protocol branch never fired, and the ACK argument
+> above makes it cheap to rule out rather than something to chase.
+
 **Abort if:** fewer than seven answer. Do not proceed with a partial bus — a
 missing shoulder joint means the arm is held by six motors and dropped by one.
+
+> **This is where the arm is now: 1 of 7.** Not a software abort — a real
+> finding, and the current blocker. See the top of this file.
 
 ---
 
@@ -152,8 +209,13 @@ that answers with the fault bit set. Clear it and find out why before going on.
 
 ## Stage 3 — Measure the PMAX scale factor by hand
 
-**The most important stage, and it is read-only.** Torque stays off; you move
-the joint with your hand.
+> **SUPERSEDED.** Measured 2026-11-10: PMAX is **12.57 rad** for `rs-06`, so
+> lerobot's `O6` (112.5) would have been 8.95× wrong. And on the MotorBridge
+> path the question does not arise at all — the SDK takes `"rs-06"` directly.
+> Kept because the method still applies to any motor whose scale constant is in
+> doubt, and because it is the only way to check one without energising it.
+
+**Read-only.** Torque stays off; you move the joint with your hand.
 
 ```bash
 ./lerobot_alohamini/.venv/bin/python tools/rs_probe.py --port can0 \
