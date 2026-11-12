@@ -952,6 +952,418 @@ def move_one(args) -> int:
         _shutdown(ctrl)
 
 
+def _command_all(motors: dict, args, targets: dict[str, float],
+                 hold: float = 0.0) -> None:
+    """Stream a target to several motors at once, for `hold` seconds.
+
+    One pass over every joint per period, not `_command` per joint in series:
+    with six motors a serial version would hold joint 1's target six periods
+    longer than joint 6's, which on an arm means the links fight each other.
+    """
+    period = 1.0 / max(1.0, args.stream_hz)
+    deadline = time.monotonic() + max(0.0, hold)
+    while True:
+        for name, target in targets.items():
+            _command(motors[name], args, target)
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(period)
+
+
+def replay(args) -> int:
+    """Drive the arm through a recorded trajectory. ALL joints, under power.
+
+    This is the largest thing in this file by risk, and it is worth being
+    explicit about why. Every other action here moves ONE joint a few degrees.
+    This moves six at once through an arbitrary path, which is both the highest
+    current the arm has drawn and the first time links can collide with each
+    other. The LRS-600-48 is specified at exactly the arm's rating with no
+    headroom, and its overload behaviour is hiccup mode -- a trip drops torque
+    on all six simultaneously and the arm falls.
+
+    So every gate that exists is applied, and two more are added:
+
+      * joints with no measured travel are REFUSED, not skipped silently
+      * every target is clamped into measured travel before it is ever sent
+      * the timeline is stretched if any segment implies more than --vlim-dps
+      * the arm is walked to frame 0 under bounded steps before playback, so
+        the first frame is never a jump from wherever it happens to be
+    """
+    path = Path(args.replay)
+    if not path.exists():
+        path = TRAJ_DIR / args.replay
+    if not path.exists():
+        print(f"no such recording: {args.replay}", file=sys.stderr)
+        avail = sorted(TRAJ_DIR.glob("traj_*.json")) if TRAJ_DIR.exists() else []
+        if avail:
+            print("available:", file=sys.stderr)
+            for p in avail[-5:]:
+                print(f"    {p.name}", file=sys.stderr)
+        return 2
+    try:
+        doc = json.loads(path.read_text())
+        frames = doc["frames"]
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"cannot read {path}: {exc}", file=sys.stderr)
+        return 2
+    if len(frames) < 2:
+        print(f"{path} holds {len(frames)} frame(s); nothing to replay.",
+              file=sys.stderr)
+        return 2
+
+    # Which joints can be driven at all. A joint with no measured travel has
+    # no clamp available, and an unclamped target on a 36 N.m motor is how
+    # elbow_flex found a hard stop at 58.7 N.m.
+    rngs = _load_ranges()
+    recorded = [n for n in CAN_IDS if any(n in f["pos"] for f in frames)]
+
+    # --joints is applied BEFORE the range check, not after. The other order
+    # makes the refusal below a dead end: it tells the caller to drop the
+    # unmeasured joint with --joints, and then refuses again on the same joint
+    # because it was still in `blocked`.
+    if args.joints:
+        want = [j.strip() for j in args.joints.split(",") if j.strip()]
+        bad = [j for j in want if j not in recorded]
+        if bad:
+            print(f"not in this recording: {', '.join(bad)}\n"
+                  f"it holds: {', '.join(recorded)}", file=sys.stderr)
+            return 2
+        recorded = [n for n in recorded if n in want]
+
+    playable = [n for n in recorded if n in rngs]
+    blocked = [n for n in recorded if n not in rngs]
+    if blocked and not args.skip_range_check:
+        print(f"REFUSING: no measured travel for {', '.join(blocked)}.\n"
+              f"Every target has to be clamped into a measured range before it "
+              f"is sent.\nSweep them first -- torque stays off:\n"
+              f"    python tools/mb_bringup.py --ranges --joint {blocked[0]}\n"
+              f"Or drop them from this replay:\n"
+              f"    ... --replay {path.name} --joints "
+              f"{','.join(playable)}", file=sys.stderr)
+        return 2
+    if not playable:
+        print("no playable joints.", file=sys.stderr)
+        return 2
+
+    # Clamp first, THEN measure the motion. Clamping after a velocity check
+    # would mean checking speeds the arm is never commanded to make.
+    clamped: dict[str, int] = {n: 0 for n in playable}
+    track: list[tuple[float, dict[str, float]]] = []
+    for f in frames:
+        row = {}
+        for n in playable:
+            if n not in f["pos"]:
+                continue
+            r = rngs[n]
+            lo = r["min_deg"] + RANGE_MARGIN_DEG
+            hi = r["max_deg"] - RANGE_MARGIN_DEG
+            if lo > hi:  # travel narrower than two margins
+                lo = hi = (r["min_deg"] + r["max_deg"]) / 2.0
+            v = min(hi, max(lo, f["pos"][n]))
+            if abs(v - f["pos"][n]) > 1e-6:
+                clamped[n] += 1
+            row[n] = v
+        if row:
+            track.append((f["t"], row))
+    if len(track) < 2:
+        print("nothing left after clamping.", file=sys.stderr)
+        return 2
+
+    # Stretch the timeline so no segment demands more than --vlim-dps. The
+    # motor would clamp this itself in POS_VEL, but then playback silently
+    # lags the timeline and every later frame is a growing step change.
+    worst_dps, worst_at = 0.0, ""
+    for (t0, a), (t1, b) in zip(track, track[1:]):
+        dt = max(1e-3, t1 - t0)
+        for n in a.keys() & b.keys():
+            dps = abs(b[n] - a[n]) / dt
+            if dps > worst_dps:
+                worst_dps, worst_at = dps, n
+    # ORDER MATTERS. Applying the vlim floor and THEN dividing by --speed lets
+    # --speed undo it: a 15 dps recording at --speed 5 came out as 0.20x, i.e.
+    # 75 dps, against a 20 dps limit, while the flag's help promised it could
+    # never do that. The floor has to be the last word.
+    stretch = max(0.05, 1.0 / max(0.05, args.speed))
+    vlim_floor = worst_dps / max(1.0, args.vlim_dps)
+    stretch = max(stretch, vlim_floor, 1e-3)
+    capped = vlim_floor > 1.0 / max(0.05, args.speed)
+
+    print(f"{path.name}: {len(track)} frames, {track[-1][0]:.1f} s recorded")
+    print(f"joints: {', '.join(playable)}")
+    if blocked:
+        print(f"EXCLUDED (no measured travel): {', '.join(blocked)}")
+    any_clamped = {n: c for n, c in clamped.items() if c}
+    if any_clamped:
+        print("clamped into measured travel: " + ", ".join(
+            f"{n} {c} frames" for n, c in any_clamped.items()))
+    pace = ("as recorded" if abs(stretch - 1.0) < 0.01
+            else f"{stretch:.2f}x slower" if stretch > 1.0
+            else f"{1.0 / stretch:.2f}x faster")
+    print(f"fastest segment {worst_dps:.1f} dps ({worst_at}), playing {pace} "
+          f"-> {worst_dps / stretch:.1f} dps peak, {track[-1][0] * stretch:.1f} s"
+          + (f"  [capped by --vlim-dps {args.vlim_dps:.0f}]" if capped else ""))
+
+    mb, ctrl, motors = _open(args)
+    motors = {n: m for n, m in motors.items() if n in playable}
+    engaged = False
+    try:
+        _reporting(motors.values(), True)
+        time.sleep(0.3)
+        start = _sample_all(ctrl, motors)
+        missing = [n for n in playable if "pos_deg" not in start.get(n, {})]
+        if missing:
+            print(f"not answering: {', '.join(missing)}. Run --scan.",
+                  file=sys.stderr)
+            return 1
+
+        first = track[0][1]
+        print(f"\n{'joint':<15}{'now':>9}{'frame 0':>9}{'approach':>10}")
+        print("-" * 43)
+        far = 0.0
+        for n in playable:
+            d = first[n] - start[n]["pos_deg"]
+            far = max(far, abs(d))
+            print(f"{n:<15}{start[n]['pos_deg']:>9.2f}{first[n]:>9.2f}"
+                  f"{d:>+10.2f}")
+        print(f"\nlargest approach move: {far:.2f} deg")
+
+        if args.dry_run:
+            print("\n--dry-run: nothing was enabled.")
+            return 0
+
+        print(f"\n!! ALL {len(playable)} JOINTS GO UNDER POWER AT ONCE.\n"
+              f"   Support the arm. Keep a hand on the DC switch -- it is the "
+              f"only abort that works if the stream stalls.\n"
+              f"   Guards: {args.abort_deg:.0f} deg error, "
+              f"{args.max_temp:.0f} degC, torque ceiling per model.")
+        if sys.stdin.isatty():
+            if input("type 'replay' to continue: ").strip() != "replay":
+                print("aborted.")
+                return 1
+
+        for m in motors.values():
+            m.ensure_mode(_mode_of(args), args.mode_timeout_ms)
+        hold = {n: start[n]["pos_deg"] for n in playable}
+        _command_all(motors, args, hold)
+        for m in motors.values():
+            m.enable()
+        engaged = True
+        _command_all(motors, args, hold, hold=0.4)
+        print("\nenabled, holding.")
+
+        # Approach frame 0 under the same bounded steps --move uses.
+        print("approaching frame 0...")
+        while True:
+            step_left = False
+            for n in playable:
+                d = first[n] - hold[n]
+                if abs(d) > 1e-3:
+                    hold[n] += max(-args.max_step_deg,
+                                   min(args.max_step_deg, d))
+                    step_left = True
+            _command_all(motors, args, hold, hold=args.settle)
+            rc = _guard(ctrl, motors, args, hold)
+            if rc:
+                return rc
+            if not step_left:
+                break
+        print("at frame 0.\n")
+
+        print(f"{'t':>7}{'frame':>8}" + "".join(f"{n[:7]:>9}" for n in playable)
+              + f"{'maxerr':>9}{'maxtq':>8}{'maxT':>6}")
+        print("-" * (15 + 9 * len(playable) + 23))
+
+        t_start = time.monotonic()
+        worst_err = worst_tq = worst_temp = 0.0
+        for i, (t, row) in enumerate(track):
+            due = t_start + t * stretch
+            while True:
+                now = time.monotonic()
+                if now >= due:
+                    break
+                _command_all(motors, args, row)
+                time.sleep(min(0.01, due - now))
+            _command_all(motors, args, row)
+            s = _sample_all(ctrl, motors)
+            err = max((abs(s[n]["pos_deg"] - row[n])
+                       for n in row if "pos_deg" in s.get(n, {})), default=0.0)
+            tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
+            tp = max((s[n].get("temp", 0.0) for n in s), default=0.0)
+            worst_err = max(worst_err, err)
+            worst_tq = max(worst_tq, tq)
+            worst_temp = max(worst_temp, tp)
+            if i % 5 == 0 or i == len(track) - 1:
+                sys.stdout.write(
+                    f"\r\033[2K{t * stretch:>7.1f}{i:>8}" +
+                    "".join(f"{row[n]:>9.1f}" for n in playable) +
+                    f"{err:>9.2f}{tq:>8.2f}{tp:>6.0f}")
+                sys.stdout.flush()
+            rc = _guard(ctrl, motors, args, row, sampled=s)
+            if rc:
+                return rc
+
+        print(f"\n\nreplayed {len(track)} frames in "
+              f"{time.monotonic() - t_start:.1f} s")
+        print(f"worst tracking error {worst_err:.2f} deg, peak torque "
+              f"{worst_tq:.2f} N.m, peak {worst_temp:.0f} degC")
+        if worst_err > args.abort_deg / 3:
+            print(f"\n!! {worst_err:.2f} deg is high. Read the torque column "
+                  f"before replaying faster.")
+        return 0
+    except KeyboardInterrupt:
+        print("\n\ninterrupted -- disabling torque.")
+        return 1
+    finally:
+        if engaged:
+            for n, m in motors.items():
+                try:
+                    m.disable()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"\n!! could not disable {n}: {exc}\n"
+                          f"!! CUT THE DC SWITCH.", file=sys.stderr)
+            print("torque disabled.")
+        _reporting(motors.values(), False)
+        _shutdown(ctrl)
+
+
+def _guard(ctrl, motors, args, targets: dict[str, float],
+           sampled: dict | None = None) -> int:
+    """Torque / temperature / tracking check across every driven joint.
+
+    Returns non-zero to abort. Shared by the approach and the playback so a
+    joint cannot be protected during one and bare during the other.
+    """
+    s = sampled if sampled is not None else _sample_all(ctrl, motors)
+    for name, st in s.items():
+        if name not in targets:
+            continue
+        model = MOTOR_MODELS[name]
+        ceiling = (args.max_torque if args.max_torque is not None
+                   else RATED_TORQUE_NM[model] * STALL_TORQUE_FRAC)
+        tq = st.get("torque", 0.0)
+        tp = st.get("temp", 0.0)
+        pos = st.get("pos_deg", float("nan"))
+        if math.isfinite(tq) and abs(tq) > ceiling:
+            print(f"\n\nABORT: {name} at {tq:+.2f} N.m exceeds {ceiling:.1f} "
+                  f"({model}, rated {RATED_TORQUE_NM[model]:.0f}).\n"
+                  f"It is driving into something -- a stop, the bench, or "
+                  f"another link. Do NOT raise the ceiling to get past it.")
+            return 1
+        if math.isfinite(tp) and tp > args.max_temp:
+            print(f"\n\nABORT: {name} at {tp:.0f} degC exceeds --max-temp "
+                  f"{args.max_temp:.0f}. Let it cool.")
+            return 1
+        if math.isfinite(pos) and abs(pos - targets[name]) > args.abort_deg:
+            print(f"\n\nABORT: {name} is {pos - targets[name]:+.2f} deg from "
+                  f"target, past --abort-deg {args.abort_deg:.0f}.\n"
+                  f"Either it is obstructed, or the 48 V rail dropped and it "
+                  f"lost torque. Check --scan.")
+            return 1
+    return 0
+
+
+#: Where `--record` writes and `--replay` reads. Not `calibration/`: a
+#: trajectory is a thing the arm did once, not a property of the hardware.
+TRAJ_DIR = Path(__file__).resolve().parent.parent / "recordings"
+
+#: Frames per second for `--record`. `_sample_all` costs ~21 ms a pass, so 20 Hz
+#: leaves room; hand motion has nothing above a few Hz in it anyway.
+RECORD_HZ = 20.0
+
+
+def record(args) -> int:
+    """Capture the arm's pose over time BY HAND. Never enables torque.
+
+    Same contract as `--ranges`: torque stays off, you move the arm, the
+    encoders report where it went. The difference is that this keeps the whole
+    time series rather than just the extremes.
+
+        python tools/mb_bringup.py --record
+
+    Saves continuously, for the reason written on `_write_ranges`: a recording
+    is minutes of somebody moving an arm, and holding it in memory until the
+    end means one bad exit throws all of it away.
+    """
+    mb, ctrl, motors = _open(args)
+    try:
+        _reporting(motors.values(), True)
+        time.sleep(0.3)
+        TRAJ_DIR.mkdir(parents=True, exist_ok=True)
+        path = TRAJ_DIR / f"traj_{time.strftime('%Y%m%d_%H%M%S')}.json"
+
+        print("TORQUE IS OFF AND STAYS OFF. Move the arm through the motion "
+              "you want played back.\nCtrl-C when done.\n")
+        print("Start from a pose you can return to -- replay begins by driving "
+              "the arm to frame 0.\n")
+
+        frames: list[dict] = []
+        t0 = time.monotonic()
+        period = 1.0 / RECORD_HZ
+        next_frame = t0
+        next_save = t0 + 2.0
+        try:
+            while True:
+                now = time.monotonic()
+                if now < next_frame:
+                    time.sleep(min(0.005, next_frame - now))
+                    continue
+                next_frame += period
+                sample = _sample_all(ctrl, motors)
+                pos = {n: round(s["pos_deg"], 3)
+                       for n, s in sample.items() if "pos_deg" in s}
+                if pos:
+                    frames.append({"t": round(time.monotonic() - t0, 4),
+                                   "pos": pos})
+                if time.monotonic() >= next_save:
+                    _write_traj(path, frames)
+                    next_save = time.monotonic() + 2.0
+                if frames:
+                    sys.stdout.write(
+                        f"\r\033[2K{len(frames)} frames, "
+                        f"{frames[-1]['t']:6.1f} s  " +
+                        "  ".join(f"{n[:6]}{p:+7.1f}"
+                                  for n, p in frames[-1]["pos"].items()))
+                    sys.stdout.flush()
+        except KeyboardInterrupt:
+            pass
+
+        _write_traj(path, frames)
+        if len(frames) < 2:
+            print("\n\nNothing recorded.", file=sys.stderr)
+            return 1
+        span = frames[-1]["t"]
+        print(f"\n\n{len(frames)} frames over {span:.1f} s -> {path}")
+        print(f"\n{'joint':<15}{'start':>9}{'end':>9}{'min':>9}{'max':>9}"
+              f"{'travel':>9}")
+        print("-" * 60)
+        for name in CAN_IDS:
+            vals = [f["pos"][name] for f in frames if name in f["pos"]]
+            if not vals:
+                continue
+            print(f"{name:<15}{vals[0]:>9.2f}{vals[-1]:>9.2f}{min(vals):>9.2f}"
+                  f"{max(vals):>9.2f}{max(vals) - min(vals):>9.2f}")
+        print(f"\nReplay it with:\n"
+              f"    python tools/mb_bringup.py --replay {path.name}")
+        return 0
+    finally:
+        _reporting(motors.values(), False)
+        _shutdown(ctrl)
+
+
+def _write_traj(path: Path, frames: list[dict]) -> None:
+    """Atomic, incremental. Same reasoning as `_write_ranges`."""
+    if not frames:
+        return
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(
+        {"recorded": time.strftime("%Y-%m-%dT%H:%M:%S"),
+         "hz": RECORD_HZ,
+         "note": "hand-moved, torque off. Positions are degrees against the "
+                 "zero in force when recorded -- a re-zero invalidates this.",
+         "frames": frames}, separators=(",", ":")) + "\n")
+    tmp.replace(path)
+
+
 def _command(motor, args, target_deg: float, hold: float = 0.0) -> None:
     """Hold a position target by streaming it. Degrees in, radians on the wire.
 
@@ -1196,8 +1608,18 @@ def main() -> int:
     action.add_argument("--ranges", action="store_true",
                         help="record travel by hand; torque stays OFF. "
                              "--joint records that one and keeps the rest")
+    action.add_argument("--record", action="store_true",
+                        help="capture a hand-moved trajectory; torque OFF")
+    action.add_argument("--replay", metavar="FILE",
+                        help="drive a recorded trajectory. ALL joints, "
+                             "under power")
 
     p.add_argument("--joint", choices=sorted(CAN_IDS))
+    p.add_argument("--joints", metavar="A,B",
+                   help="--replay only: restrict to these joints")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="--replay only: <1 plays slower. Never plays faster "
+                        "than --vlim-dps allows")
     p.add_argument("--amplitude", type=float, default=5.0,
                    help="degrees either side of the present position")
     p.add_argument("--direction", choices=("both", "up", "down"),
@@ -1251,6 +1673,10 @@ def main() -> int:
         return clear_faults(args)
     if args.ranges:
         return ranges(args)
+    if args.record:
+        return record(args)
+    if args.replay:
+        return replay(args)
     if args.move:
         if not args.joint:
             p.error("--move needs --joint")

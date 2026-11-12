@@ -1,0 +1,3 @@
+# trajectories are session artefacts, not hardware facts
+*.json
+!.gitignore
