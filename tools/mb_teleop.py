@@ -78,7 +78,7 @@ swept while disassembled and returned 434 deg of free motor rotation.
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import sys
 import time
 from pathlib import Path
@@ -165,6 +165,62 @@ class JointMap:
             return 0.0
         inside = min(hi, self.follower[1]) - max(lo, self.follower[0])
         return max(0.0, 1.0 - max(0.0, inside) / span)
+
+
+#: Which joints have been watched moving the right way, and under which sign.
+#:
+#: This exists because "the joint moved" and "the joint moved the right way"
+#: are different facts, and only the second one makes it safe to add a joint to
+#: the set. Keeping it on disk rather than in anyone's head means the tool can
+#: refuse, instead of the operator having to remember which of six joints were
+#: checked three hours ago.
+DIRECTIONS_PATH = REPO_ROOT / "calibration" / "teleop_directions.json"
+
+
+def _load_directions() -> dict[str, dict]:
+    try:
+        return json.loads(DIRECTIONS_PATH.read_text()).get("joints", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def _confirm_directions(names: list[str], maps: dict[str, JointMap]) -> int:
+    """Record that these joints were watched following the leader correctly."""
+    bad = [n for n in names if n not in maps]
+    if bad:
+        print(f"--confirm: not driven this run: {', '.join(bad)}",
+              file=sys.stderr)
+        return 2
+    doc = {"joints": _load_directions()}
+    today = time.strftime("%Y-%m-%d")
+    for n in names:
+        doc["joints"][n] = {"direction": maps[n].direction, "verified": today}
+    doc["note"] = ("Joints watched following the leader the correct way on "
+                   "the physical arm. 'direction' is the sign that was "
+                   "verified -- running with the opposite sign is NOT covered "
+                   "by this entry.")
+    doc["joints"] = {n: doc["joints"][n] for n in JOINTS if n in doc["joints"]}
+    tmp = DIRECTIONS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc, indent=2) + "\n")
+    tmp.replace(DIRECTIONS_PATH)
+    print(f"recorded {', '.join(names)} as direction-verified "
+          f"-> {DIRECTIONS_PATH}")
+    return 0
+
+
+def _direction_status(maps: dict[str, JointMap]) -> dict[str, str]:
+    """Per joint: 'ok', 'unverified', or 'sign-changed'."""
+    known = _load_directions()
+    out = {}
+    for n, jm in maps.items():
+        entry = known.get(n)
+        if entry is None:
+            out[n] = "unverified"
+        elif entry.get("direction") != jm.direction:
+            out[n] = "sign-changed"
+        else:
+            out[n] = "ok"
+    return out
 
 
 def build_maps(args, ranges: dict[str, dict[str, float]]) -> dict[str, JointMap]:
@@ -306,6 +362,40 @@ def teleop(args) -> int:
                   f"{first[n] - now:>+9.2f}"
                   + ("" if n in maps else "   held"))
         print(f"\nlargest move to engage: {gap:.2f} deg")
+
+        status = _direction_status(maps)
+        print(f"\n{'joint':<15}{'sign':>6}  direction")
+        print("-" * 44)
+        for n, st in status.items():
+            note = {"ok": "verified on hardware",
+                    "unverified": "NEVER WATCHED MOVING",
+                    "sign-changed": "verified under the OPPOSITE sign"}[st]
+            print(f"{n:<15}{maps[n].direction:>+6}  {note}")
+        unsafe = [n for n, st in status.items() if st != "ok"]
+        # A SINGLE unverified joint is not refused, because driving one joint
+        # at a bounded step rate IS how a direction gets verified -- refusing
+        # it would make the refusal's own advice impossible to follow. What is
+        # refused is carrying an unknown sign into a multi-joint run, where a
+        # reversed joint drives into a stop while five others are also moving.
+        if unsafe and len(maps) > 1 and not args.skip_direction_check:
+            print(f"\nREFUSED: {len(unsafe)} of {len(maps)} joints have never "
+                  f"been watched following the\nleader: "
+                  f"{', '.join(unsafe)}\n"
+                  f"\nDo them ONE at a time -- that run is allowed, and it is "
+                  f"how this gets\ncleared -- then record each one:\n"
+                  f"    {Path(__file__).name} --joints {unsafe[0]}\n"
+                  f"    {Path(__file__).name} --joints {unsafe[0]} "
+                  f"--confirm {unsafe[0]}\n"
+                  f"\nAdd --invert {unsafe[0]} first if it follows backwards. "
+                  f"Override with\n--skip-direction-check, but a reversed "
+                  f"joint under power drives itself\ninto a stop at full "
+                  f"commanded speed.", file=sys.stderr)
+            return 1
+        if unsafe and len(maps) == 1:
+            print(f"\n!! {unsafe[0]} has an UNVERIFIED direction. That is what "
+                  f"this run is for.\n   Move the leader a little and watch "
+                  f"which way it goes. If it is backwards,\n   stop and re-run "
+                  f"with --invert {unsafe[0]}.")
         if gap > args.max_engage_deg:
             print(f"\nREFUSED: {gap:.2f} deg exceeds --max-engage-deg "
                   f"{args.max_engage_deg:.0f}.\n"
@@ -318,6 +408,22 @@ def teleop(args) -> int:
                       "travel. Re-sweep it rather than widening this limit.",
                       file=sys.stderr)
             return 1
+
+        if args.preflight:
+            print(f"\n--preflight: everything above was read from the live "
+                  f"arm. Nothing was\nenabled and no target was sent. The "
+                  f"guards that will apply:\n"
+                  f"    torque    per model, or --max-torque\n"
+                  f"    temp      {args.max_temp:.0f} degC\n"
+                  f"    tracking  {args.abort_deg:.0f} deg from target\n"
+                  f"    rate      {args.max_step_deg:.1f} deg per control "
+                  f"step at {args.fps:.0f} Hz\n"
+                  f"    velocity  {args.vlim_dps:.0f} dps, "
+                  f"{args.acc_dpss:.0f} dps^2, clamped in firmware\n"
+                  f"    leader lost -> hold {args.hold_on_fault:.0f} s, then "
+                  f"release\n"
+                  f"\nRun the same command without --preflight to engage.")
+            return 0
 
         print(f"\n!! {len(motors)} JOINTS GO UNDER POWER. The follower will "
               f"track your hand\n   on the leader in real time, as fast as "
@@ -340,7 +446,12 @@ def teleop(args) -> int:
         engaged = True
         mb._command_all(motors, args, hold, hold=0.4)
         print("\nenabled, holding. Move the leader. Ctrl-C to stop.\n")
-        return _live_loop(leader, ctrl, motors, maps, args, hold)
+        rc = _live_loop(leader, ctrl, motors, maps, args, hold)
+        if rc == 0 and args.confirm is not None:
+            names = ([n.strip() for n in args.confirm.split(",") if n.strip()]
+                     or list(maps))
+            rc = _confirm_directions(names, maps)
+        return rc
     except KeyboardInterrupt:
         print("\n\ninterrupted.")
         return 1
@@ -483,68 +594,81 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
     i = 0
     t0 = time.monotonic()
     due = t0
-    while time.monotonic() < deadline:
-        try:
-            action = leader.get_action()
-        except Exception as exc:  # noqa: BLE001
-            # OBSERVED, not hypothetical: the leader's USB adapter dropped out
-            # mid-run on 2026-11-12 and sync_read raised for all seven ids.
-            #
-            # Letting that propagate would unwind straight into the `finally`
-            # and disable() every motor at once, which is the worst possible
-            # response while the arm is holding itself up -- it drops torque on
-            # six joints simultaneously and the arm falls. The leader going
-            # quiet says nothing at all about the follower, which is still
-            # answering and still tracking its last target perfectly well.
-            #
-            # So freeze: keep streaming the target the arm is already at, under
-            # the same guards, and give the operator time to take the weight.
-            print(f"\n\nLEADER STOPPED ANSWERING: {exc}")
-            print(_leader_lost_advice(args))
-            return _freeze(ctrl, motors, args, hold)
-        for n in names:
-            want = maps[n].apply(action[f"{n}.pos"])
-            if abs(maps[n].raw(action[f"{n}.pos"]) - want) > 1e-6:
-                clamped += 1
-            # Rate limit per control step. The leader can be yanked; the
-            # follower weighs 10 kg and must not try to keep up.
-            delta = want - hold[n]
-            hold[n] += max(-args.max_step_deg,
-                           min(args.max_step_deg, delta))
-        mb._command_all(motors, args, hold)
+    # Ctrl-C is how a teleop session ENDS, not how it fails: there is no other
+    # way to stop one. Catching it here rather than letting it reach the
+    # caller means the run still prints its summary and still counts as a
+    # success, which is what --confirm keys off.
+    stopped = False
+    try:
+        while time.monotonic() < deadline:
+            try:
+                action = leader.get_action()
+            except Exception as exc:  # noqa: BLE001
+                # OBSERVED, not hypothetical: the leader's USB adapter dropped
+                # out mid-run on 2026-11-12 and sync_read raised for all seven
+                # ids.
+                #
+                # Letting that propagate would unwind into the `finally` and
+                # disable() every motor at once, which is the worst possible
+                # response while the arm is holding itself up -- it drops
+                # torque on six joints simultaneously and the arm falls. The
+                # leader going quiet says nothing at all about the follower,
+                # which is still answering and still tracking its last target
+                # perfectly well.
+                #
+                # So freeze: keep streaming the target the arm is already at,
+                # under the same guards, and give the operator time to take
+                # the weight.
+                print(f"\n\nLEADER STOPPED ANSWERING: {exc}")
+                print(_leader_lost_advice(args))
+                return _freeze(ctrl, motors, args, hold)
+            for n in names:
+                want = maps[n].apply(action[f"{n}.pos"])
+                if abs(maps[n].raw(action[f"{n}.pos"]) - want) > 1e-6:
+                    clamped += 1
+                # Rate limit per control step. The leader can be yanked; the
+                # follower weighs 10 kg and must not try to keep up.
+                delta = want - hold[n]
+                hold[n] += max(-args.max_step_deg,
+                               min(args.max_step_deg, delta))
+            mb._command_all(motors, args, hold)
 
-        s = mb._sample_all(ctrl, motors)
-        err = max((abs(s[n]["pos_deg"] - hold[n])
-                   for n in hold if "pos_deg" in s.get(n, {})), default=0.0)
-        tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
-        tp = max((s[n].get("temp", 0.0) for n in s), default=0.0)
-        worst_err = max(worst_err, err)
-        worst_tq = max(worst_tq, tq)
-        worst_temp = max(worst_temp, tp)
-        if i % 5 == 0 and sys.stdout.isatty():
-            sys.stdout.write(
-                f"\r\033[2K" + "".join(f"{hold[n]:>9.1f}" for n in names)
-                + f"{err:>9.2f}{tq:>8.2f}{tp:>6.0f}{clamped:>7}")
-            sys.stdout.flush()
-        rc = mb._guard(ctrl, motors, args, hold, sampled=s)
-        if rc:
-            return rc
-        i += 1
-        # Fixed cadence against a running deadline, not `sleep(period)`:
-        # `_sample_all` alone costs ~21 ms, so sleeping a full period on top
-        # of the loop body would halve the rate the leader is read at. If a
-        # pass overruns, skip the sleep rather than accumulating lag.
-        due += period
-        now = time.monotonic()
-        if due < now:
-            # Already behind. Forfeit the lost time instead of banking it --
-            # otherwise one slow pass makes the next dozen free-run.
-            due = now
-        else:
-            time.sleep(due - now)
+            s = mb._sample_all(ctrl, motors)
+            err = max((abs(s[n]["pos_deg"] - hold[n])
+                       for n in hold if "pos_deg" in s.get(n, {})), default=0.0)
+            tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
+            tp = max((s[n].get("temp", 0.0) for n in s), default=0.0)
+            worst_err = max(worst_err, err)
+            worst_tq = max(worst_tq, tq)
+            worst_temp = max(worst_temp, tp)
+            if i % 5 == 0 and sys.stdout.isatty():
+                sys.stdout.write(
+                    f"\r\033[2K" + "".join(f"{hold[n]:>8.1f}" for n in names)
+                    + f"{err:>9.2f}{tq:>8.2f}{tp:>6.0f}{clamped:>7}")
+                sys.stdout.flush()
+            rc = mb._guard(ctrl, motors, args, hold, sampled=s)
+            if rc:
+                return rc
+            i += 1
+            # Fixed cadence against a running deadline, not `sleep(period)`:
+            # `_sample_all` alone costs ~21 ms, so sleeping a full period on
+            # top of the loop body would halve the rate the leader is read at.
+            # If a pass overruns, skip the sleep rather than accumulating lag.
+            due += period
+            now = time.monotonic()
+            if due < now:
+                # Already behind. Forfeit the lost time instead of banking it
+                # -- otherwise one slow pass makes the next dozen free-run.
+                due = now
+            else:
+                time.sleep(due - now)
+    except KeyboardInterrupt:
+        stopped = True
 
     dt = time.monotonic() - t0
-    print(f"\n\n{i} frames in {dt:.1f} s ({i / max(dt, 1e-3):.1f} Hz)")
+    if stopped:
+        print("\n\nstopped by operator.")
+    print(f"\n{i} frames in {dt:.1f} s ({i / max(dt, 1e-3):.1f} Hz)")
     print(f"worst tracking error {worst_err:.2f} deg, peak torque "
           f"{worst_tq:.2f} N.m, peak {worst_temp:.0f} degC")
     if clamped:
@@ -564,6 +688,18 @@ def main() -> int:
     p.add_argument("--host-id", type=lambda s: int(s, 0), default=0xFD)
     p.add_argument("--dry-run", action="store_true",
                    help="leader only. No CAN, no torque, nothing sent.")
+    p.add_argument("--preflight", action="store_true",
+                   help="read BOTH arms, print the real engage table, the "
+                        "direction ledger and every guard, then stop without "
+                        "enabling anything. The check to run before all six.")
+    p.add_argument("--confirm", nargs="?", const="", default=None,
+                   metavar="A,B",
+                   help="after a clean run, record these joints as "
+                        "direction-verified. Bare --confirm records every "
+                        "joint driven this run.")
+    p.add_argument("--skip-direction-check", action="store_true",
+                   help="drive joints that have never been watched following "
+                        "the leader. A reversed joint drives into a stop.")
     p.add_argument("--joints", metavar="A,B",
                    help="drive only these; the rest are held where they are")
     p.add_argument("--invert", default="", metavar="A,B",
