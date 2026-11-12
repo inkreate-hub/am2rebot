@@ -1,0 +1,15 @@
+bus can0, host id 0xFD, active reporting on, no torque enabled
+
+joint           id   model   pos deg  vel dps  torque   temp  reply
+------------------------------------------------------------------------
+shoulder_pan     1   rs-06    -88.35     2.52    0.00   26.0  ok
+shoulder_lift    2   rs-06     -0.86    -0.80    0.00   25.0  ok
+elbow_flex       3   rs-06     -0.09     1.05    0.00   26.0  ok
+wrist_flex       4   rs-00      1.30    -0.52    0.00   25.0  ok
+wrist_yaw        5   rs-00     10.90     0.79    0.00   25.0  ok
+wrist_roll       6   rs-00   -103.71     2.27    0.00   25.0  ok
+gripper          7   rs-00   -124.68    -2.36    0.00   25.0  ok
+
+7/7 answered.
+GATE PASSED. Positions should be stable and repeatable -- run this twice without touching the arm and compare.
+Next: park in the sit-down pose, then --zero.
