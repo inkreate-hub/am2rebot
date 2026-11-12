@@ -1,31 +1,36 @@
 {
-  "recorded": "2026-11-12T13:35:43",
-  "note": "hand-driven, torque off. Endpoints are where the joint stopped feeling free, not the true mechanical stop.",
+  "recorded": "2026-11-12T13:45:40",
+  "note": "hand-driven, torque off. Endpoints are where the joint stopped feeling free, not the true mechanical stop. gripper NOT recorded: swept 2026-11-12 while disassembled, so its 434.74 deg was free motor travel, not jaw travel. Re-sweep it assembled.",
   "joints": {
     "shoulder_pan": {
-      "min_deg": -9.78,
-      "max_deg": 1.19,
-      "travel_deg": 10.96
+      "min_deg": -61.26,
+      "max_deg": 209.6,
+      "travel_deg": 270.87
+    },
+    "shoulder_lift": {
+      "min_deg": -0.35,
+      "max_deg": 208.79,
+      "travel_deg": 209.14
+    },
+    "elbow_flex": {
+      "min_deg": -0.26,
+      "max_deg": 243.4,
+      "travel_deg": 243.66
     },
     "wrist_flex": {
-      "min_deg": -26.39,
-      "max_deg": 0.26,
-      "travel_deg": 26.65
+      "min_deg": -97.21,
+      "max_deg": 45.44,
+      "travel_deg": 142.65
     },
     "wrist_yaw": {
-      "min_deg": -5.89,
-      "max_deg": 88.42,
-      "travel_deg": 94.31
+      "min_deg": -116.66,
+      "max_deg": 97.17,
+      "travel_deg": 213.82
     },
     "wrist_roll": {
-      "min_deg": 10.72,
-      "max_deg": 127.95,
-      "travel_deg": 117.23
-    },
-    "gripper": {
-      "min_deg": 38.59,
-      "max_deg": 165.44,
-      "travel_deg": 126.85
+      "min_deg": -139.66,
+      "max_deg": 300.29,
+      "travel_deg": 439.95
     }
   }
 }
