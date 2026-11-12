@@ -429,11 +429,6 @@ def ranges(args) -> int:
         # costs one pass and needs no request at all.
         print(f"{'joint':<15}{'now':>9}{'min':>9}{'max':>9}{'travel':>9}")
         print("-" * 51)
-        if tty:
-            # Placeholder rows for the in-place redraw to move back up over.
-            for _ in CAN_IDS:
-                print()
-
         try:
             while True:
                 for name, s in _sample_all(ctrl, motors).items():
@@ -450,10 +445,18 @@ def ranges(args) -> int:
                     next_save = time.monotonic() + 2.0
 
                 if tty:
-                    # Redraw in place: up N lines, rewrite each, clear to EOL.
-                    sys.stdout.write(f"\033[{len(CAN_IDS)}A")
-                    for name in CAN_IDS:
-                        sys.stdout.write(f"\033[2K{_range_row(name, now, lo, hi)}\n")
+                    # Redraw in place. The final row carries NO newline: with
+                    # the cursor on the last line of the window, writing one
+                    # scrolls the buffer, and the next `\033[nA` then lands a
+                    # line short. That drift is what smeared this table into
+                    # four rows repeating while the last three sat below it.
+                    # So move up N-1, return to column 0, and leave the cursor
+                    # parked at the end of the last row.
+                    if samples > 1:
+                        sys.stdout.write(f"\033[{len(CAN_IDS) - 1}A\r")
+                    rows = (f"\033[2K{_range_row(n, now, lo, hi)}"
+                            for n in CAN_IDS)
+                    sys.stdout.write("\n".join(rows))
                     sys.stdout.flush()
                 elif time.monotonic() >= next_print:
                     # Piped or captured: cursor movement does not collapse
@@ -464,7 +467,7 @@ def ranges(args) -> int:
                         print(f"  {_range_row(name, now, lo, hi)}")
                     next_print = time.monotonic() + 5.0
         except KeyboardInterrupt:
-            print(f"\n{samples} samples.\n")
+            print(f"\n\n{samples} samples.\n")
 
         # The data is already on disk by now -- the loop has been saving every
         # two seconds. Everything below is reporting, so a second Ctrl-C

@@ -1,5 +1,5 @@
 {
-  "recorded": "2026-11-12T13:34:43",
+  "recorded": "2026-11-12T13:35:43",
   "note": "hand-driven, torque off. Endpoints are where the joint stopped feeling free, not the true mechanical stop.",
   "joints": {
     "shoulder_pan": {
