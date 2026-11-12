@@ -50,6 +50,13 @@ different pose and measured end to end. A sign that was right in the model is
 not thereby right here. Verify one joint at a time with `--joints`, and flip
 with `--invert` rather than editing a constant you will forget about.
 
+**Nothing here can detect a wrong sign for you, and `--max-engage-deg` is not
+that check.** Pose alignment sets each offset so the first target equals the
+follower's current position *whatever the direction is*, so a reversed joint
+engages with a gap of zero like any other. It shows up the moment you move the
+leader: the follower goes the other way. That is why joint one at a time, with
+your hand on the DC switch, is the procedure and not a suggestion.
+
 THE ORDER TO USE THIS IN
 
     # 1. no CAN at all. Leader only. Move it and watch the mapped targets.
@@ -294,8 +301,13 @@ def teleop(args) -> int:
             print(f"\nREFUSED: {gap:.2f} deg exceeds --max-engage-deg "
                   f"{args.max_engage_deg:.0f}.\n"
                   f"Move the LEADER until its shape matches the follower's, "
-                  f"then run this again.\nWith --align pose the gap should be "
-                  f"~0; a large one means a sign is wrong.", file=sys.stderr)
+                  f"then run this again.", file=sys.stderr)
+            if args.align == "pose":
+                print("Under --align pose the gap is only ever the endpoint "
+                      "margin lifting a joint\noff its stop, so this big a gap "
+                      "means a joint is parked outside its own\nmeasured "
+                      "travel. Re-sweep it rather than widening this limit.",
+                      file=sys.stderr)
             return 1
 
         print(f"\n!! {len(motors)} JOINTS GO UNDER POWER. The follower will "
