@@ -292,13 +292,20 @@ def scan(args) -> int:
             return 0
         if answered == 0:
             print("Nothing answered at all. In order of likelihood:\n"
+                  f"  - the link is ERROR-PASSIVE from an earlier failed run "
+                  f"and its TX queue is jammed. THIS REPORTS A HEALTHY BUS AS "
+                  f"DEAD, and the state survives until the link is bounced:\n"
+                  f"        sudo ip link set {args.port} down && \\\n"
+                  f"        sudo ip link set {args.port} up type can "
+                  f"bitrate 1000000\n"
+                  f"    Check first:  ip -s -d link show {args.port}\n"
                   "  - can0 is up but not actually wired to the arm, or the "
                   "120 ohm termination is missing\n"
                   "  - arm not powered (48 V)\n"
                   "  - motors are in RobStride's private protocol rather than "
                   "MIT comm mode\n"
                   "  - wrong host id: try --host-id 0xFF / 0xFE / 0x00 / 0xAA\n"
-                  "Confirm frames exist at all with:  candump -tz can0")
+                  f"Confirm frames exist at all with:  candump -tz {args.port}")
             return 1
         print("PARTIAL BUS -- do not proceed. A missing shoulder motor means "
               "the arm is held by six and dropped by one. Find the silent "
