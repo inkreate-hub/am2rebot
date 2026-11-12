@@ -354,6 +354,114 @@ you measure more is worse than no ceiling.
 Not yet run on this arm. Until it is, the ceilings are still the datasheet
 guess — only now the guess no longer aborts on gravity alone.
 
+## No payload, just extended — why a single ceiling can never work, 2026-11-12
+
+The operator's question after the fall was the right one: *why was it about to
+drop when there was no payload and the arm was only extended?* Because there
+**is** a payload and it is the arm. At `lift 136.7 / elbow 143.7` the shoulder
+measured **19.28 N·m** holding nothing but its own forearm, wrist and gripper
+at full lever arm. The rs-06 is rated **36 N·m**. The motor was at 54% of rated
+and in no difficulty whatever — the *software* was.
+
+An unloaded arm at full extension is not a corner case. It is the most loaded
+static pose the machine will ever see in normal use, and teleop reaches it
+constantly.
+
+### Mis-set in one of two ways, and no good value between them
+
+Gravity torque at the shoulder is a function of pose. Over this arm's travel it
+runs from near zero (links stacked over the axis) to its maximum (extended,
+horizontal). A single number must sit either above that maximum or below it:
+
+| ceiling | extended poses | folded poses |
+|---|---|---|
+| above the max | never false-aborts | **blind** — 17 N·m into the bench sits under an 18 N·m ceiling and says nothing |
+| below the max | **false-aborts** on every reach — this is what dropped the arm | catches it |
+
+Raising the number trades one failure for the other. This is structural, not a
+tuning problem, and it is why the number was wrong twice in one day in opposite
+directions.
+
+### Ask what the pose explains, not whether the torque is large
+
+Gravity load is *predictable from the joint angles*. An obstruction, a collision
+or a payload is not. So the guard now compares measured torque against predicted
+torque and watches the **residual** — the part gravity does not account for.
+
+For a planar serial chain the gravity torque at joint *k* sums over every link
+outboard of it:
+
+```
+tau_k = SUM_{j >= k} [ a_j*cos(THETA_j) + b_j*sin(THETA_j) ] + c
+```
+
+`THETA_j` is the **cumulative** angle base-to-link-*j*, because it is a link's
+world attitude that gravity cares about. The `sin` terms carry each joint's
+arbitrary zero phase — this arm has no persistent calibration and is zeroed
+against whatever pose it is parked in, so nothing starts from horizontal. `c`
+absorbs steady sensor bias.
+
+That is **linear in its coefficients**: ordinary least squares via normal
+equations, no dynamics library and no new dependency. `shoulder_lift` gets 7
+free parameters, `elbow_flex` 5, `wrist_flex` 3. `shoulder_pan` is excluded on
+purpose — it rotates about a vertical axis, so gravity exerts no moment about it
+and a model would be fitting noise.
+
+### Samples come from ordinary use, not another autonomous sweep
+
+The obvious way to get data is to command a 2D grid over (lift, elbow). That
+means the arm driving itself through its most heavily loaded poses to learn what
+they cost, which is the one thing the day's history argues against.
+
+Teleop already visits those poses, under a hand, with the operator choosing
+where it goes. So samples are logged during normal sessions — only when every
+chain joint is **near-stationary** (a moving link adds inertial torque the model
+has no term for) and **tracking** (a frame taken mid-stall would teach the model
+that an obstruction is normal for that pose, which is exactly what it exists to
+notice). The fit runs offline, moves nothing, and improves every session.
+
+```bash
+python tools/mb_bringup.py --fit-gravity   # reads the log, moves nothing
+```
+
+It refuses to write a model unless the data earns it, because the guard
+*trusts* a fitted prediction and a bad one explains away real obstructions:
+
+| gate | why |
+|---|---|
+| ≥150 samples | 7 free parameters fitted to 20 points is a confident-looking model of nothing |
+| ≥40° of travel on every angle it depends on | an arm that only moved its elbow teaches nothing about the shoulder's dependence on lift |
+| residual must beat 0.8 × the spread in the data | if predicting the mean does as well, there is no pose dependence here and the coefficients are noise |
+
+### What this buys, in both directions
+
+Verified against a synthetic arm whose true torques are known, with phases set
+so the shoulder reads 19.28 N·m at the exact pose that dropped the real one
+(`test_posemodel.py`, 22/22):
+
+- **19.28 N·m extended, tracking → no abort.** Including with the 2.43° lag
+  actually seen on hardware.
+- **17 N·m in a light pose, 4° of error, not moving → ABORT.** The same case
+  with `--no-gravity-model` returns clean, which demonstrates the blind spot
+  rather than asserting it.
+- **+6 N·m over what an extended pose explains → ABORT.** Extension does not buy
+  immunity.
+- The **hard ceiling (85% of rated) is untouched** and still fires regardless of
+  tracking. A measurement claiming a joint needs that much to stand still is
+  evidence something is wrong with the arm, not a licence to allow it.
+
+The fitted model lives in `calibration/gravity_model.json` and is committed — it
+is the measured identity of this particular arm. The raw sample log is not: it
+is append-only, grows at the control rate, and is regenerable.
+
+### Still missing
+
+The freeze is a hold, not a descent. When `--hold-max-temp` arrives the arm goes
+limp wherever it is. **Retracting the elbow collapses the shoulder's lever arm
+and takes the gravity load toward zero** — the fitted model can say which
+direction does that, which makes a genuine controlled park possible rather than
+a longer wait before the same fall. Not built.
+
 ## Diagnostics that lie
 
 **An ERROR-PASSIVE link reports a healthy bus as dead.** A scan returned 0/7

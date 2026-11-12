@@ -423,10 +423,18 @@ def teleop(args) -> int:
             return _refuse(msg)
 
         if args.preflight:
+            gm = {} if args.no_gravity_model else mb._load_gravity_model()
+            if gm:
+                tq_line = ("residual vs fitted gravity model ("
+                           + ", ".join(sorted(gm)) + ")")
+            else:
+                tq_line = ("fixed ceilings -- NO gravity model fitted, so "
+                           "the guard is blind\n              in folded poses. "
+                           "Run a session, then --fit-gravity")
             print(f"\n--preflight: everything above was read from the live "
                   f"arm. Nothing was\nenabled and no target was sent. The "
                   f"guards that will apply:\n"
-                  f"    torque    per model, or --max-torque\n"
+                  f"    torque    {tq_line}\n"
                   f"    temp      {args.max_temp:.0f} degC\n"
                   f"    tracking  {args.abort_deg:.0f} deg from target\n"
                   f"    rate      {args.max_step_deg:.1f} deg per control "
@@ -607,6 +615,19 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
     # caller means the run still prints its summary and still counts as a
     # success, which is what --confirm keys off.
     stopped = False
+    # Gravity samples are collected from ORDINARY USE -- see the note above
+    # `PITCH_CHAIN` in mb_bringup. Teleop already drives the arm through the
+    # loaded poses, under a hand, with the operator choosing where it goes, so
+    # there is no reason to make it drive itself through them again to learn
+    # what they cost. Opening this append is the entire cost;
+    # `_log_gravity_sample` decides per frame whether the frame is usable and
+    # is written so it cannot raise into the control loop.
+    gfh = None
+    if not args.no_gravity_log:
+        try:
+            gfh = open(mb.GRAVITY_SAMPLES_PATH, "a")
+        except OSError as exc:  # noqa: BLE001
+            print(f"(not logging gravity samples: {exc})")
     try:
         while time.monotonic() < deadline:
             try:
@@ -642,6 +663,7 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
             mb._command_all(motors, args, hold)
 
             s = mb._sample_all(ctrl, motors)
+            mb._log_gravity_sample(gfh, s, hold)
             err = max((abs(s[n]["pos_deg"] - hold[n])
                        for n in hold if "pos_deg" in s.get(n, {})), default=0.0)
             tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
@@ -676,6 +698,9 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
                 time.sleep(due - now)
     except KeyboardInterrupt:
         stopped = True
+    finally:
+        if gfh is not None:
+            gfh.close()
 
     dt = time.monotonic() - t0
     if stopped:
@@ -693,6 +718,14 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
     if clamped:
         print(f"{clamped} joint-frames hit a travel limit -- the leader was "
               f"asking for more than the follower has.")
+    if gfh is not None and mb.GRAVITY_SAMPLES_PATH.exists():
+        n = sum(1 for _ in mb.GRAVITY_SAMPLES_PATH.open())
+        have = mb._load_gravity_model()
+        print(f"\n{n} gravity samples logged in total"
+              + (" -- model is fitted." if have else
+                 f", {mb.MIN_FIT_SAMPLES} needed to fit.")
+              + "\n  mb_bringup.py --fit-gravity   "
+                "(reads the log, moves nothing)")
     return 0
 
 
@@ -751,6 +784,11 @@ def main() -> int:
     p.add_argument("--abort-deg", type=float, default=15.0)
     p.add_argument("--max-torque", type=float, default=None)
     p.add_argument("--max-temp", type=float, default=mb.STALL_TEMP_C)
+    p.add_argument("--no-gravity-model", action="store_true",
+                   help="guard on fixed torque ceilings even if a fitted "
+                        "gravity_model.json exists")
+    p.add_argument("--no-gravity-log", action="store_true",
+                   help="do not append pose/torque samples for --fit-gravity")
     p.add_argument("--mode-timeout-ms", type=int, default=1000)
     p.add_argument("--retries", type=int, default=5)
     p.add_argument("--kp", type=float, default=8.0)

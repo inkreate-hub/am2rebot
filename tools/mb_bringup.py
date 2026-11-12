@@ -756,6 +756,263 @@ def _ceilings(args) -> dict[str, tuple[float, float, float]]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Pose-aware gravity model
+#
+# WHY A SCALAR CEILING CANNOT BE MADE CORRECT -- 2026-11-12, after the fall.
+#
+# The question that forced this was the operator's: why was it about to drop
+# when there was no payload and the arm was only extended? The answer is that
+# there IS a payload and it is the arm. At `lift 136.7 / elbow 143.7` the
+# shoulder measured 19.28 N.m holding nothing but its own forearm, wrist and
+# gripper at full lever arm. The rs-06 is rated 36. The motor was at 54% of
+# rated and in no difficulty whatever. The ceiling was at 50%, so the SOFTWARE
+# was the thing in difficulty.
+#
+# Raising the number does not fix the shape of the problem. Gravity torque at
+# the shoulder is a function of pose, and over this arm's travel it runs from
+# near zero (folded, links stacked over the axis) to its maximum (extended,
+# horizontal). Any single number must sit either above that maximum or below
+# it, and both choices are bad in a specific way:
+#
+#     ceiling above the max   never false-aborts, and is BLIND in the folded
+#                             poses -- a joint can drive into the bench at
+#                             17 N.m with gravity explaining 2 of it, and
+#                             nothing fires, because 17 < 18.
+#     ceiling below the max   catches that, and false-aborts every time the
+#                             operator extends the arm. This is what dropped it.
+#
+# The fix is to stop asking "is this torque large" and start asking "is this
+# torque MORE THAN THIS POSE EXPLAINS". Gravity load is predictable from the
+# joint angles; an obstruction, a collision or a payload is not. The difference
+# between measured and predicted -- the residual -- is the part that gravity
+# does not account for, and that is the only part worth guarding.
+#
+# THE MODEL. For a planar serial chain the gravity torque at joint k is a sum
+# over every link outboard of it:
+#
+#     tau_k = SUM_{j >= k} [ alpha_j*cos(THETA_j) + beta_j*sin(THETA_j) ] + c
+#
+# where THETA_j is the CUMULATIVE angle from the base to link j. The alphas and
+# betas absorb the link masses, the centre-of-mass distances, g, and -- this is
+# why the sin terms are there -- the arbitrary phase of each joint's zero. The
+# arm has no persistent calibration and is zeroed against whatever pose it is
+# parked in, so no angle here can be assumed to start from horizontal. A free
+# constant `c` absorbs any steady sensor bias.
+#
+# That expression is LINEAR in its coefficients, which is the whole reason this
+# is tractable without a dynamics library: ordinary least squares, solved from
+# the normal equations, in a few dozen lines of arithmetic below.
+#
+# WHERE THE DATA COMES FROM, and why it is not another autonomous sweep. The
+# first instinct was a commanded 2D grid over (lift, elbow). That means the arm
+# driving itself through its most heavily loaded poses to learn what they cost,
+# which is the one thing recent history argues against. Teleop already visits
+# those poses, under a hand, with the operator deciding where it goes. So the
+# samples are LOGGED FROM ORDINARY USE -- `_log_gravity_sample`, called from the
+# teleop loop whenever the arm is near-stationary and tracking -- and the fit
+# runs offline afterwards. Nothing moves to collect them, the coverage improves
+# every session, and the model is always fitted to how this arm is actually
+# used rather than to a grid someone guessed at.
+# --------------------------------------------------------------------------
+
+#: Joints whose angles accumulate into the vertical plane that gravity acts in,
+#: ordered base-outward. `shoulder_pan` is deliberately absent: it rotates about
+#: a VERTICAL axis, so gravity exerts no moment about it and a model would be
+#: fitting noise. `wrist_yaw`, `wrist_roll` and `gripper` are absent for the
+#: same reason or because the mass outboard of them is negligible.
+PITCH_CHAIN: tuple[str, ...] = ("shoulder_lift", "elbow_flex", "wrist_flex")
+
+#: Smallest residual worth calling abnormal, N.m, per motor model. A floor under
+#: whatever the fit's own scatter suggests -- without it, a very clean fit on a
+#: cold arm would set a threshold so tight that friction and stiction alone
+#: trip it.
+MIN_RESIDUAL_NM: dict[str, float] = {"rs-06": 3.0, "rs-00": 1.5}
+
+#: How many times the fit's RMS residual counts as "more than this pose
+#: explains". 4 sigma on a model with hundreds of samples is a long way out.
+RESIDUAL_SIGMA = 4.0
+
+#: Refuse to fit from fewer than this many samples per joint. The widest model
+#: (`shoulder_lift`) has 7 free parameters; fitting 7 parameters to 20 points
+#: produces a confident-looking model of nothing.
+MIN_FIT_SAMPLES = 150
+
+#: ...and refuse if the poses are all alike. A model fitted to one corner of the
+#: workspace extrapolates catastrophically into the rest of it.
+MIN_FIT_SPAN_DEG = 40.0
+
+GRAVITY_MODEL_PATH = RANGES_PATH.parent / "gravity_model.json"
+GRAVITY_SAMPLES_PATH = RANGES_PATH.parent / "gravity_samples.jsonl"
+
+
+def _chain_angles(pose: dict[str, float]) -> list[float] | None:
+    """Cumulative chain angles, radians. `None` if any link angle is missing.
+
+    Cumulative because link 2's attitude in the world depends on where links 0
+    and 1 put it, and it is world attitude that gravity cares about.
+    """
+    out: list[float] = []
+    total = 0.0
+    for name in PITCH_CHAIN:
+        a = pose.get(name)
+        if a is None or not math.isfinite(a):
+            return None
+        total += math.radians(a)
+        out.append(total)
+    return out
+
+
+def _features(name: str, pose: dict[str, float]) -> list[float] | None:
+    """Regressors for `name` at `pose`, or `None` if it has no model.
+
+    A joint only sees the links OUTBOARD of it -- the mass between it and the
+    base hangs off the base, not off this motor -- so the feature vector gets
+    shorter the further out the joint is. `shoulder_lift` gets 7 terms,
+    `elbow_flex` 5, `wrist_flex` 3.
+    """
+    if name not in PITCH_CHAIN:
+        return None
+    angles = _chain_angles(pose)
+    if angles is None:
+        return None
+    k = PITCH_CHAIN.index(name)
+    feats: list[float] = []
+    for th in angles[k:]:
+        feats.append(math.cos(th))
+        feats.append(math.sin(th))
+    feats.append(1.0)
+    return feats
+
+
+def _solve_ridge(rows: list[list[float]], ys: list[float],
+                 lam: float = 1e-6) -> list[float] | None:
+    """Least-squares fit of `rows @ x = ys`, by normal equations.
+
+    `lam` is a tiny ridge term on the diagonal. It is not there to regularise
+    in the statistical sense -- it is there so that a rank-deficient design
+    matrix (the operator moved only one joint all session) produces a damped
+    answer instead of a division by something near zero. The caller still has
+    to check coverage; this only stops the arithmetic from exploding.
+
+    Pure Python on purpose: this file's whole dependency surface is motorbridge
+    and the standard library, and a 7x7 solve does not justify changing that.
+    """
+    n = len(rows[0])
+    ata = [[0.0] * (n + 1) for _ in range(n)]
+    for row, y in zip(rows, ys):
+        for i in range(n):
+            ri = row[i]
+            for j in range(n):
+                ata[i][j] += ri * row[j]
+            ata[i][n] += ri * y
+    for i in range(n):
+        ata[i][i] += lam
+
+    for col in range(n):                       # Gauss, partial pivoting.
+        piv = max(range(col, n), key=lambda r: abs(ata[r][col]))
+        if abs(ata[piv][col]) < 1e-12:
+            return None
+        ata[col], ata[piv] = ata[piv], ata[col]
+        pv = ata[col][col]
+        for j in range(col, n + 1):
+            ata[col][j] /= pv
+        for r in range(n):
+            if r == col:
+                continue
+            f = ata[r][col]
+            if f:
+                for j in range(col, n + 1):
+                    ata[r][j] -= f * ata[col][j]
+    return [ata[i][n] for i in range(n)]
+
+
+def _load_gravity_model() -> dict[str, dict]:
+    if not GRAVITY_MODEL_PATH.exists():
+        return {}
+    try:
+        return json.loads(GRAVITY_MODEL_PATH.read_text()).get("joints", {})
+    except (OSError, ValueError):
+        return {}
+
+
+#: `_guard` runs at the stream rate. Re-reading and re-parsing the model file
+#: 20 times a second to get the same answer would be the single most expensive
+#: thing in the loop, so it is read once per process.
+_GMODEL_CACHE: dict[str, dict] | None = None
+
+
+def _gmodel() -> dict[str, dict]:
+    global _GMODEL_CACHE
+    if _GMODEL_CACHE is None:
+        _GMODEL_CACHE = _load_gravity_model()
+    return _GMODEL_CACHE
+
+
+def _expected_torque(name: str, pose: dict[str, float],
+                     gmodel: dict[str, dict]) -> float | None:
+    """Torque this pose explains, N.m, or `None` if it cannot be predicted."""
+    entry = gmodel.get(name)
+    if not entry:
+        return None
+    feats = _features(name, pose)
+    coef = entry.get("coef")
+    if feats is None or not coef or len(coef) != len(feats):
+        return None
+    return sum(c * f for c, f in zip(coef, feats))
+
+
+def _residual_limit(name: str, gmodel: dict[str, dict]) -> float | None:
+    entry = gmodel.get(name)
+    if not entry:
+        return None
+    rms = float(entry.get("resid_rms", 0.0))
+    return max(MIN_RESIDUAL_NM[MOTOR_MODELS[name]], RESIDUAL_SIGMA * rms)
+
+
+def _log_gravity_sample(fh, sampled: dict[str, dict],
+                        targets: dict[str, float]) -> None:
+    """Append one settled sample, if this frame qualifies. Never raises.
+
+    QUALIFYING MATTERS MORE THAN QUANTITY. The model describes STATIC gravity
+    load, so a frame is only usable when the arm is near-stationary -- a moving
+    link adds inertial torque the model has no term for, and feeding those in
+    biases every coefficient. Requiring the joint to be tracking does the same
+    job for the other direction: a frame taken mid-stall would teach the model
+    that an obstruction is normal for that pose, which is precisely the thing
+    it exists to notice.
+
+    Never raises because this runs inside the teleop control loop. A full disk
+    is not a reason to drop an arm.
+    """
+    if fh is None:
+        return
+    pose = {n: st.get("pos_deg") for n, st in sampled.items()}
+    if _chain_angles(pose) is None:
+        return
+    rec: dict[str, float] = {}
+    for name in PITCH_CHAIN:
+        st = sampled.get(name)
+        if not st:
+            return
+        vel = st.get("vel_dps", float("nan"))
+        if not math.isfinite(vel) or abs(vel) > STALL_VEL_DPS:
+            return                              # moving: inertia, not gravity
+        if name in targets:
+            pos = st.get("pos_deg", float("nan"))
+            if (math.isfinite(pos)
+                    and abs(pos - targets[name]) > STALL_ERR_DEG):
+                return                          # not tracking: possibly stalled
+    for name in PITCH_CHAIN:
+        st = sampled[name]
+        rec[name] = round(float(st["pos_deg"]), 3)
+        rec[name + "_tq"] = round(float(st.get("torque", 0.0)), 3)
+    try:
+        fh.write(json.dumps(rec) + "\n")
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def clear_faults(args) -> int:
     """Clear latched faults on all seven. Enables no torque, commands no move.
 
@@ -1524,6 +1781,143 @@ def _write_gravity(peak: dict[str, float], peak_at: dict[str, float],
     tmp.replace(GRAVITY_PATH)
 
 
+def fit_gravity(args) -> int:
+    """Fit the pose model from logged teleop samples. Touches no hardware.
+
+    Reads `gravity_samples.jsonl`, fits each chain joint by least squares, and
+    writes `gravity_model.json` -- but only for joints that earn it. The three
+    gates below exist because a bad model here is worse than no model: the
+    guard TRUSTS a fitted prediction, and a prediction fitted to one corner of
+    the workspace will happily explain away 20 N.m of obstruction in a pose it
+    has never seen.
+
+      enough samples   `MIN_FIT_SAMPLES`, against 7 free parameters.
+      enough spread    `MIN_FIT_SPAN_DEG` of travel on every chain angle the
+                       joint depends on. An arm that only ever moved its elbow
+                       teaches nothing about the shoulder's dependence on lift.
+      beats a constant the fit must explain real variance. If predicting the
+                       mean does as well, there is no pose dependence in this
+                       data and the coefficients are noise.
+
+    Run it after any teleop session. The sample log appends, so coverage
+    accumulates and a model fitted today is refitted better next week.
+    """
+    if not GRAVITY_SAMPLES_PATH.exists():
+        print(f"No samples at {GRAVITY_SAMPLES_PATH}.\n"
+              f"They are written by the teleop loop. Run a normal session "
+              f"first -- move the arm through\nthe poses you actually use, "
+              f"especially extended ones, then come back and fit.")
+        return 1
+
+    rows: list[dict] = []
+    bad = 0
+    for line in GRAVITY_SAMPLES_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            bad += 1
+    print(f"{len(rows)} samples from {GRAVITY_SAMPLES_PATH.name}"
+          + (f" ({bad} unparseable lines skipped)" if bad else ""))
+    if not rows:
+        return 1
+
+    out: dict[str, dict] = {}
+    print()
+    for name in PITCH_CHAIN:
+        key = name + "_tq"
+        design: list[list[float]] = []
+        ys: list[float] = []
+        poses: list[dict[str, float]] = []
+        for r in rows:
+            if key not in r:
+                continue
+            pose = {j: r[j] for j in PITCH_CHAIN if j in r}
+            feats = _features(name, pose)
+            if feats is None:
+                continue
+            design.append(feats)
+            ys.append(float(r[key]))
+            poses.append(pose)
+
+        if len(design) < MIN_FIT_SAMPLES:
+            print(f"  {name:<14} SKIPPED -- {len(design)} samples, needs "
+                  f"{MIN_FIT_SAMPLES}. Collect more.")
+            continue
+
+        k = PITCH_CHAIN.index(name)
+        spans = []
+        for j in PITCH_CHAIN[k:]:
+            vals = [p[j] for p in poses if j in p]
+            spans.append(max(vals) - min(vals) if vals else 0.0)
+        if min(spans) < MIN_FIT_SPAN_DEG:
+            thin = PITCH_CHAIN[k:][spans.index(min(spans))]
+            print(f"  {name:<14} SKIPPED -- {thin} only moved "
+                  f"{min(spans):.0f} deg, needs {MIN_FIT_SPAN_DEG:.0f}.\n"
+                  f"  {'':<14} The data cannot separate its effect from the "
+                  f"constant term.")
+            continue
+
+        coef = _solve_ridge(design, ys)
+        if coef is None:
+            print(f"  {name:<14} SKIPPED -- design matrix is singular.")
+            continue
+
+        resid = [y - sum(c * f for c, f in zip(coef, row))
+                 for row, y in zip(design, ys)]
+        rms = math.sqrt(sum(e * e for e in resid) / len(resid))
+        mean = sum(ys) / len(ys)
+        sd = math.sqrt(sum((y - mean) ** 2 for y in ys) / len(ys))
+        if sd < 1e-9 or rms > 0.8 * sd:
+            print(f"  {name:<14} SKIPPED -- residual {rms:.2f} N.m vs "
+                  f"{sd:.2f} spread in the data.\n"
+                  f"  {'':<14} The pose does not explain the torque here. "
+                  f"Not writing a model that adds nothing.")
+            continue
+
+        lim = max(MIN_RESIDUAL_NM[MOTOR_MODELS[name]], RESIDUAL_SIGMA * rms)
+        out[name] = {
+            "coef": [round(c, 6) for c in coef],
+            "terms": [f"{t}({j})" for j in PITCH_CHAIN[k:]
+                      for t in ("cos", "sin")] + ["1"],
+            "samples": len(design),
+            "resid_rms": round(rms, 4),
+            "resid_max": round(max(abs(e) for e in resid), 4),
+            "torque_sd": round(sd, 4),
+            "span_deg": {j: round(s, 1)
+                         for j, s in zip(PITCH_CHAIN[k:], spans)},
+        }
+        print(f"  {name:<14} fitted from {len(design):>5} samples: "
+              f"residual {rms:.2f} N.m rms, {max(abs(e) for e in resid):.2f} "
+              f"max,\n  {'':<14} against {sd:.2f} N.m of spread. "
+              f"Guard will flag past {lim:.1f} N.m unexplained.")
+
+    if not out:
+        print("\nNothing fitted. The guard keeps its fixed ceilings, which "
+              "means it stays blind in folded\nposes and twitchy in extended "
+              "ones. Collect more varied samples and run this again.")
+        return 1
+
+    tmp = GRAVITY_MODEL_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(
+        {"fitted": time.strftime("%Y-%m-%dT%H:%M:%S"),
+         "note": "Least-squares gravity model, tau_k = sum_{j>=k} "
+                 "a_j*cos(THETA_j) + b_j*sin(THETA_j) + c, where THETA_j is "
+                 "the cumulative chain angle in radians. Fitted from "
+                 "near-stationary, tracking teleop samples. Regenerate with "
+                 "--fit-gravity after any session.",
+         "chain": list(PITCH_CHAIN),
+         "joints": out}, indent=2) + "\n")
+    tmp.replace(GRAVITY_MODEL_PATH)
+    print(f"\nwrote {GRAVITY_MODEL_PATH}")
+    print("The guard now asks whether the torque is more than the POSE "
+          "explains, not whether it is\nlarge. Extended poses stop "
+          "false-aborting; folded poses stop being blind.")
+    return 0
+
+
 def _guard(ctrl, motors, args, targets: dict[str, float],
            sampled: dict | None = None,
            warned: set[str] | None = None) -> int:
@@ -1546,6 +1940,8 @@ def _guard(ctrl, motors, args, targets: dict[str, float],
     """
     s = sampled if sampled is not None else _sample_all(ctrl, motors)
     ceilings = _ceilings(args)
+    gmodel = {} if getattr(args, "no_gravity_model", False) else _gmodel()
+    pose = {n: st.get("pos_deg", float("nan")) for n, st in s.items()}
     for name, st in s.items():
         if name not in targets:
             continue
@@ -1557,6 +1953,18 @@ def _guard(ctrl, motors, args, targets: dict[str, float],
         pos = st.get("pos_deg", float("nan"))
         vel = st.get("vel_dps", float("nan"))
         err = abs(pos - targets[name]) if math.isfinite(pos) else 0.0
+
+        # What does this POSE say the torque should be? When there is a fitted
+        # model, that prediction replaces the fixed stall ceiling entirely --
+        # see the long note above `PITCH_CHAIN`. The residual is the part
+        # gravity does not account for, and it is sensitive in exactly the
+        # poses the scalar was blind in: folded, where 17 N.m of obstruction
+        # used to sit under an 18 N.m ceiling and say nothing.
+        exp = _expected_torque(name, pose, gmodel)
+        lim = _residual_limit(name, gmodel)
+        modelled = (exp is not None and lim is not None
+                    and math.isfinite(tq))
+        resid = (tq - exp) if modelled else 0.0
 
         if math.isfinite(tq) and abs(tq) > hard_nm:
             print(f"\n\nABORT: {name} at {tq:+.2f} N.m is past the hard "
@@ -1571,27 +1979,49 @@ def _guard(ctrl, motors, args, targets: dict[str, float],
         # large error that is still travelling is catching up, and a joint with
         # no error is not being asked for anything it is failing to do, however
         # hard it is working to stay there.
-        if (math.isfinite(tq) and abs(tq) > stall_nm
-                and err > STALL_ERR_DEG
+        # Two thresholds without a model, one with. The fixed pair existed only
+        # because a scalar cannot tell a heavy pose from an obstruction, so it
+        # needed a low number to abort on and a higher one merely to mention.
+        # A residual already separates those cases, so it serves both.
+        if modelled:
+            over = over_warn = abs(resid) > lim
+        else:
+            over = math.isfinite(tq) and abs(tq) > stall_nm
+            over_warn = math.isfinite(tq) and abs(tq) > warn_nm
+
+        if (over and err > STALL_ERR_DEG
                 and math.isfinite(vel) and abs(vel) < STALL_VEL_DPS):
-            print(f"\n\nABORT: {name} is STALLED -- {tq:+.2f} N.m, "
+            detail = (f"{tq:+.2f} N.m where this pose explains {exp:+.2f} "
+                      f"-- {resid:+.2f} unaccounted for" if modelled
+                      else f"{tq:+.2f} N.m")
+            print(f"\n\nABORT: {name} is STALLED -- {detail},\n"
                   f"{err:.2f} deg from target, moving {vel:+.1f} deg/s.\n"
-                  f"High torque, not getting there, not moving. It is "
-                  f"driving into something: a stop, the bench,\n"
-                  f"or another link. Do NOT raise --max-torque to get "
-                  f"past it.")
+                  f"Torque the pose does not explain, not getting there, "
+                  f"not moving. It is driving into\nsomething: a stop, the "
+                  f"bench, or another link. Do NOT raise --max-torque to "
+                  f"get past it.")
             return 1
 
-        if (math.isfinite(tq) and abs(tq) > warn_nm
-                and warned is not None and name not in warned):
+        if over_warn and warned is not None and name not in warned:
             warned.add(name)
-            print(f"\n\n!! {name} is carrying {tq:+.2f} N.m, over the "
-                  f"{warn_nm:.1f} warn ceiling, but tracking to "
-                  f"{err:.2f} deg.\n"
-                  f"!! Reading that as the arm's own weight, not a stall. "
-                  f"Hard ceiling is {hard_nm:.1f}.\n"
-                  f"!! Measure the real envelope with --gravity-map so "
-                  f"this stops being an inference.\n")
+            if modelled:
+                print(f"\n\n!! {name} is carrying {tq:+.2f} N.m where this "
+                      f"pose explains {exp:+.2f} --\n"
+                      f"!! {resid:+.2f} N.m unaccounted for, past the "
+                      f"{lim:.1f} limit, but tracking to {err:.2f} deg.\n"
+                      f"!! Something is touching the arm, or there is a "
+                      f"payload in the gripper. Not a stall.\n"
+                      f"!! Hard ceiling is {hard_nm:.1f}.\n")
+            else:
+                print(f"\n\n!! {name} is carrying {tq:+.2f} N.m, over the "
+                      f"{warn_nm:.1f} warn ceiling, but tracking to "
+                      f"{err:.2f} deg.\n"
+                      f"!! Reading that as the arm's own weight, not a stall. "
+                      f"Hard ceiling is {hard_nm:.1f}.\n"
+                      f"!! There is no fitted gravity model, so this is an "
+                      f"inference from one number.\n"
+                      f"!! Run --fit-gravity after this session to replace "
+                      f"it with a pose-aware one.\n")
 
         if math.isfinite(tp) and tp > args.max_temp:
             print(f"\n\nABORT: {name} at {tp:.0f} degC exceeds --max-temp "
@@ -2100,6 +2530,10 @@ def main() -> int:
                              "joint carried. ALL joints under power. This is "
                              "what sets the torque ceilings from measurement "
                              "instead of from the datasheet")
+    action.add_argument("--fit-gravity", action="store_true",
+                        help="fit the pose-aware gravity model from samples "
+                             "logged during teleop. Touches NO hardware, "
+                             "moves nothing. Run it after a session")
 
     p.add_argument("--joint", choices=sorted(CAN_IDS))
     p.add_argument("--joints", metavar="A,B",
@@ -2145,6 +2579,12 @@ def main() -> int:
                         "rated (rs-06 30.6, rs-00 11.9)")
     p.add_argument("--max-temp", type=float, default=STALL_TEMP_C,
                    help="degC abort ceiling")
+    p.add_argument("--no-gravity-model", action="store_true",
+                   help="ignore a fitted gravity_model.json and guard on the "
+                        "fixed ceilings instead. For comparing the two, or if "
+                        "a bad fit is misbehaving -- note the fixed ceilings "
+                        "are blind in folded poses, which is why the model "
+                        "exists")
     p.add_argument("--skip-range-check", action="store_true",
                    help="energise a joint whose travel was never recorded")
     p.add_argument("--cycles", type=int, default=2)
@@ -2178,6 +2618,8 @@ def main() -> int:
         return record(args)
     if args.replay:
         return replay(args)
+    if args.fit_gravity:
+        return fit_gravity(args)
     if args.gravity_map:
         if not args.joint:
             p.error("--gravity-map needs --joint")

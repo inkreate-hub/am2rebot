@@ -10,3 +10,9 @@ __pycache__/
 # Subtask 2: vendored MuJoCo model, fetched by setup.sh (no LICENSE upstream)
 vendor/
 reports/sweep-*.png
+
+# Raw gravity samples: append-only, one line per control frame, grows without
+# bound. The fitted gravity_model.json IS committed -- it is small and it is
+# the measured identity of this arm.
+calibration/gravity_samples.jsonl
+calibration/*.json.tmp
