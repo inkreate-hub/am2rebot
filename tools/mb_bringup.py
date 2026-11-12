@@ -243,8 +243,38 @@ def introspect() -> int:
     return 0
 
 
+def _link_down_reason(port: str) -> str | None:
+    """Why this interface cannot carry traffic, or None if it looks fine.
+
+    Worth a sysfs read before every CAN action, because a down link and a dead
+    arm produce the SAME output from a scan -- seven SILENT rows -- and the
+    advice for them is completely different. The scan used to answer that with
+    a six-item list of possibilities; two of these three cases are facts.
+    """
+    base = Path("/sys/class/net") / port
+    if not base.exists():
+        return (f"no interface '{port}'. The USB-CAN adapter is not plugged "
+                f"in, or its driver did not bind.\n"
+                f"  lsusb | grep 1d50       # 1d50:606f is the candleLight\n"
+                f"  ip -brief link show type can")
+    try:
+        # IFF_UP is bit 0. A CAN link that is administratively down reports
+        # `state STOPPED` and counts nothing, which looks exactly like silence.
+        if not int(base.joinpath("flags").read_text().strip(), 16) & 1:
+            return (f"'{port}' exists but is DOWN. Nothing can be sent or "
+                    f"received until it is up:\n"
+                    f"    sudo ip link set {port} up type can bitrate 1000000")
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _open(args):
     """Controller + the seven motor handles. Enables nothing."""
+    reason = _link_down_reason(args.port)
+    if reason:
+        print(f"LINK NOT USABLE: {reason}", file=sys.stderr)
+        raise SystemExit(2)
     mb = _require_sdk()
     ctrl = mb.Controller(args.port)
     motors = {
