@@ -415,6 +415,7 @@ def ranges(args) -> int:
         hi: dict[str, float] = {}
         now: dict[str, float] = {}
         samples = 0
+        next_save = 0.0
 
         # SAMPLE ALL SEVEN PER PASS, not one at a time. `_poll` sleeps 50 ms
         # per motor while it waits on a request/response round trip, which for
@@ -437,7 +438,13 @@ def ranges(args) -> int:
                     except Exception:  # noqa: BLE001
                         break
                 for name in CAN_IDS:
-                    s = _state_dict(motors[name].get_state())
+                    # get_state() raises once the link goes down, and an
+                    # unhandled throw here would escape past the Ctrl-C
+                    # handler and take the whole sweep with it.
+                    try:
+                        s = _state_dict(motors[name].get_state())
+                    except Exception:  # noqa: BLE001
+                        continue
                     if "pos_deg" not in s:
                         continue
                     p = s["pos_deg"]
@@ -445,6 +452,10 @@ def ranges(args) -> int:
                     lo[name] = min(lo.get(name, p), p)
                     hi[name] = max(hi.get(name, p), p)
                 samples += 1
+
+                if time.monotonic() >= next_save:
+                    _write_ranges(lo, hi)
+                    next_save = time.monotonic() + 2.0
 
                 # Redraw in place: up N lines, rewrite each, clear to EOL.
                 sys.stdout.write(f"\033[{len(CAN_IDS)}A")
@@ -463,45 +474,33 @@ def ranges(args) -> int:
         except KeyboardInterrupt:
             print(f"\n{samples} samples.\n")
 
+        # The data is already on disk by now -- the loop has been saving every
+        # two seconds. Everything below is reporting, so a second Ctrl-C
+        # through here costs nothing. That was not true before: the file used
+        # to be written once, at the end, and an interrupt anywhere in this
+        # block threw away the entire sweep.
+        thin = _write_ranges(lo, hi)
         if not lo:
             print("Nothing was recorded.", file=sys.stderr)
             return 1
 
         print(f"{'joint':<15}{'min':>9}{'max':>9}{'travel':>9}")
         print("-" * 42)
-        out = {}
-        thin = []
         for name in CAN_IDS:
             if name not in lo:
                 continue
-            span = hi[name] - lo[name]
-            print(f"{name:<15}{lo[name]:>9.2f}{hi[name]:>9.2f}{span:>9.2f}")
-            # A joint that never moved was never MEASURED, and recording it as
-            # a zero-width range would be a fabricated measurement gating a
-            # real move. Leave it out: an absent entry makes `--move` say
-            # "record it first", which is the truth. A present one would say
-            # "already at a stop", which is a guess.
-            if span < 1.0:
-                thin.append(name)
-                continue
-            out[name] = {"min_deg": round(lo[name], 2),
-                         "max_deg": round(hi[name], 2),
-                         "travel_deg": round(span, 2)}
+            print(f"{name:<15}{lo[name]:>9.2f}{hi[name]:>9.2f}"
+                  f"{hi[name] - lo[name]:>9.2f}")
 
-        if not out:
+        if not RANGES_PATH.exists():
             print("\nNOTHING WAS MEASURED -- no joint moved more than 1 deg.\n"
                   "No file written, because a range nobody measured is worse "
                   "than no range at all.\nRun it again and move the arm.",
                   file=sys.stderr)
             return 1
 
-        RANGES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        RANGES_PATH.write_text(json.dumps(
-            {"recorded": time.strftime("%Y-%m-%dT%H:%M:%S"),
-             "note": "hand-driven, torque off. Endpoints are where the joint "
-                     "stopped feeling free, not the true mechanical stop.",
-             "joints": out}, indent=2) + "\n")
-        print(f"\nwrote {RANGES_PATH} ({len(out)}/{len(CAN_IDS)} joints)")
+        recorded = len(_load_ranges())
+        print(f"\nwrote {RANGES_PATH} ({recorded}/{len(CAN_IDS)} joints)")
 
         if thin:
             print(f"\n!! NOT recorded, moved under 1 deg: {', '.join(thin)}\n"
@@ -510,6 +509,45 @@ def ranges(args) -> int:
     finally:
         _reporting(motors.values(), False)
         _shutdown(ctrl)
+
+
+def _write_ranges(lo: dict[str, float], hi: dict[str, float]) -> list[str]:
+    """Persist travel measured so far. Returns the joints too thin to record.
+
+    CALLED FROM INSIDE THE SAMPLING LOOP, not only at the end. A sweep is ten
+    minutes of somebody moving an arm by hand, and on 2026-11-12 a whole one
+    was lost because the file was written once, after the loop: the process
+    was interrupted somewhere in the summary path and every sample went with
+    it. Writing continuously means an interrupt at any instant costs at most
+    the last couple of seconds.
+
+    Joints that moved under a degree are omitted rather than stored as a
+    zero-width range -- see the comment in `ranges`.
+    """
+    out, thin = {}, []
+    for name in CAN_IDS:
+        if name not in lo:
+            continue
+        span = hi[name] - lo[name]
+        if span < 1.0:
+            thin.append(name)
+            continue
+        out[name] = {"min_deg": round(lo[name], 2),
+                     "max_deg": round(hi[name], 2),
+                     "travel_deg": round(span, 2)}
+    if not out:
+        return thin
+    RANGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RANGES_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(
+        {"recorded": time.strftime("%Y-%m-%dT%H:%M:%S"),
+         "note": "hand-driven, torque off. Endpoints are where the joint "
+                 "stopped feeling free, not the true mechanical stop.",
+         "joints": out}, indent=2) + "\n")
+    # Atomic, so an interrupt mid-write cannot leave a half-parsed file
+    # standing where `--move` expects a measurement.
+    tmp.replace(RANGES_PATH)
+    return thin
 
 
 def _load_ranges() -> dict[str, dict[str, float]]:
