@@ -244,6 +244,20 @@ def build_maps(args, ranges: dict[str, dict[str, float]]) -> dict[str, JointMap]
     return maps
 
 
+def _refuse(msg: str) -> int:
+    """Print a refusal to stderr, but after everything already on stdout.
+
+    stdout is block-buffered through a pipe while stderr is not, so an
+    unflushed refusal lands ABOVE the tables it is talking about -- which is
+    how the first --preflight run read, with the verdict printed before the
+    evidence.
+    """
+    sys.stdout.flush()
+    print(msg, file=sys.stderr)
+    sys.stderr.flush()
+    return 1
+
+
 def _print_map(maps: dict[str, JointMap]) -> None:
     print(f"\n{'joint':<15}{'dir':>4}{'scale':>7}{'offset':>9}"
           f"{'leader span':>16}{'-> follower':>18}{'clip':>7}")
@@ -378,36 +392,35 @@ def teleop(args) -> int:
         # refused is carrying an unknown sign into a multi-joint run, where a
         # reversed joint drives into a stop while five others are also moving.
         if unsafe and len(maps) > 1 and not args.skip_direction_check:
-            print(f"\nREFUSED: {len(unsafe)} of {len(maps)} joints have never "
-                  f"been watched following the\nleader: "
-                  f"{', '.join(unsafe)}\n"
-                  f"\nDo them ONE at a time -- that run is allowed, and it is "
-                  f"how this gets\ncleared -- then record each one:\n"
-                  f"    {Path(__file__).name} --joints {unsafe[0]}\n"
-                  f"    {Path(__file__).name} --joints {unsafe[0]} "
-                  f"--confirm {unsafe[0]}\n"
-                  f"\nAdd --invert {unsafe[0]} first if it follows backwards. "
-                  f"Override with\n--skip-direction-check, but a reversed "
-                  f"joint under power drives itself\ninto a stop at full "
-                  f"commanded speed.", file=sys.stderr)
-            return 1
+            return _refuse(
+                f"\nREFUSED: {len(unsafe)} of {len(maps)} joints have never "
+                f"been watched following the\nleader: {', '.join(unsafe)}\n"
+                f"\nDo them ONE at a time -- that run is allowed, and it is "
+                f"how this gets\ncleared -- then record each one:\n"
+                f"    {Path(__file__).name} --joints {unsafe[0]}\n"
+                f"    {Path(__file__).name} --joints {unsafe[0]} "
+                f"--confirm {unsafe[0]}\n"
+                f"\nAdd --invert {unsafe[0]} first if it follows backwards. "
+                f"Override with\n--skip-direction-check, but a reversed "
+                f"joint under power drives itself\ninto a stop at full "
+                f"commanded speed.")
         if unsafe and len(maps) == 1:
             print(f"\n!! {unsafe[0]} has an UNVERIFIED direction. That is what "
                   f"this run is for.\n   Move the leader a little and watch "
                   f"which way it goes. If it is backwards,\n   stop and re-run "
                   f"with --invert {unsafe[0]}.")
         if gap > args.max_engage_deg:
-            print(f"\nREFUSED: {gap:.2f} deg exceeds --max-engage-deg "
-                  f"{args.max_engage_deg:.0f}.\n"
-                  f"Move the LEADER until its shape matches the follower's, "
-                  f"then run this again.", file=sys.stderr)
+            msg = (f"\nREFUSED: {gap:.2f} deg exceeds --max-engage-deg "
+                   f"{args.max_engage_deg:.0f}.\n"
+                   f"Move the LEADER until its shape matches the follower's, "
+                   f"then run this again.")
             if args.align == "pose":
-                print("Under --align pose the gap is only ever the endpoint "
-                      "margin lifting a joint\noff its stop, so this big a gap "
-                      "means a joint is parked outside its own\nmeasured "
-                      "travel. Re-sweep it rather than widening this limit.",
-                      file=sys.stderr)
-            return 1
+                msg += ("\nUnder --align pose the gap is only ever the "
+                        "endpoint margin lifting a\njoint off its stop, so "
+                        "this big a gap means a joint is parked outside\nits "
+                        "own measured travel. Re-sweep it rather than widening "
+                        "this limit.")
+            return _refuse(msg)
 
         if args.preflight:
             print(f"\n--preflight: everything above was read from the live "
