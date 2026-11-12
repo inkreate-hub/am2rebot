@@ -433,8 +433,12 @@ def teleop(args) -> int:
                   f"step at {args.fps:.0f} Hz\n"
                   f"    velocity  {args.vlim_dps:.0f} dps, "
                   f"{args.acc_dpss:.0f} dps^2, clamped in firmware\n"
-                  f"    leader lost -> hold {args.hold_on_fault:.0f} s, then "
-                  f"release\n"
+                  f"    on fault  "
+                  + (f"freeze until {args.hold_max_temp:.0f} degC or Ctrl-C"
+                     if args.hold_on_fault < 0 else
+                     "release torque immediately" if args.hold_on_fault == 0
+                     else f"hold {args.hold_on_fault:.0f} s, then release")
+                  + "\n"
                   f"\nRun the same command without --preflight to engage.")
             return 0
 
@@ -444,7 +448,13 @@ def teleop(args) -> int:
               f"{args.max_step_deg:.1f} per {1000.0 / args.fps:.0f} ms and "
               f"--vlim-dps {args.vlim_dps:.0f}.\n"
               f"   Support the arm. Keep a hand on the DC switch -- it is the "
-              f"only abort\n   that works if the stream stalls.")
+              f"only abort\n   that works if the stream stalls.\n"
+              + (f"   Ctrl-C and any fault FREEZE the arm in place. It holds "
+                 f"until {args.hold_max_temp:.0f} degC\n   or a second "
+                 f"Ctrl-C, so take the weight before you release it."
+                 if args.hold_on_fault < 0 else
+                 f"   Ctrl-C and any fault hold for "
+                 f"{args.hold_on_fault:.0f} s, then DROP torque."))
         if sys.stdin.isatty():
             if input("type 'teleop' to continue: ").strip() != "teleop":
                 print("aborted.")
@@ -563,6 +573,11 @@ def _freeze(ctrl, motors, args, hold: dict[str, float]) -> int:
 
     `hold` is no longer read. It stays in the signature because the call sites
     read better with the thing being held named at the call.
+
+    Note the return value is deliberately DISCARDED by the Ctrl-C path in
+    `_live_loop`: a freeze always reports 1, because it is normally reached
+    from a fault, but an operator stopping their own session on purpose has
+    not failed at anything and `--confirm` should still fire.
     """
     return mb._settle_and_release(ctrl, motors, args, engaged=True)
 
@@ -665,6 +680,13 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
     dt = time.monotonic() - t0
     if stopped:
         print("\n\nstopped by operator.")
+        # Ctrl-C used to fall straight through to the caller's `finally`,
+        # which disables all six -- the same instant drop the fault path was
+        # fixed for, reached by the one route the operator takes EVERY time.
+        # An arm parked at rest does not care. An arm the operator stopped
+        # mid-reach does. So stopping freezes first; a second Ctrl-C, once
+        # they have the weight, releases.
+        _freeze(ctrl, motors, args, hold)
     print(f"\n{i} frames in {dt:.1f} s ({i / max(dt, 1e-3):.1f} Hz)")
     print(f"worst tracking error {worst_err:.2f} deg, peak torque "
           f"{worst_tq:.2f} N.m, peak {worst_temp:.0f} degC")
@@ -710,10 +732,17 @@ def main() -> int:
                    help="refuse to start if any joint must move further")
     p.add_argument("--max-step-deg", type=float, default=1.0,
                    help="max degrees any joint may move per control step")
-    p.add_argument("--hold-on-fault", type=float, default=5.0, metavar="SEC",
-                   help="if the leader stops answering, hold the arm where it "
-                        "is for this long before dropping torque, so you can "
-                        "get a hand under it. 0 releases immediately.")
+    p.add_argument("--hold-on-fault", type=float, default=-1.0, metavar="SEC",
+                   help="on any fault, hold the arm where it is. Default -1 "
+                        "FREEZES indefinitely -- until --hold-max-temp or "
+                        "Ctrl-C -- because a 5 s countdown expired on an "
+                        "extended arm and it fell anyway. A positive number "
+                        "restores the fixed window. 0 releases immediately.")
+    p.add_argument("--hold-max-temp", type=float, default=mb.STALL_TEMP_C,
+                   metavar="DEGC",
+                   help="degC at which a freeze gives up and releases. "
+                        "Holding is not free: a loaded joint standing still "
+                        "dissipates that load continuously.")
     p.add_argument("--fps", type=float, default=20.0)
     p.add_argument("--seconds", type=float, default=0.0, help="0 = until Ctrl-C")
     p.add_argument("--vlim-dps", type=float, default=30.0)

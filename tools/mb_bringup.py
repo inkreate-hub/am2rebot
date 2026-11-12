@@ -1624,23 +1624,45 @@ def _settle_and_release(ctrl, motors, args, engaged: bool = True) -> int:
        it the torque, without removing the torque that holds the arm up. A
        stalled joint stops pushing immediately. A gravity-loaded joint keeps
        exactly the load it needs and no more.
-    2. Stream that for `--hold-on-fault` seconds, announced, then return and
+    2. Stream that, announced, until something ends the hold -- then return and
        let the caller's `finally` release.
+
+    WHAT ENDS THE HOLD, and why it is not a stopwatch by default. The first
+    version counted down 5 seconds. On 2026-11-12 that window expired while the
+    arm was fully extended and it fell anyway: five seconds is not enough to
+    read a warning and get a hand under 10 kg. A clock is the wrong thing to
+    key on, because the clock knows nothing about the arm.
+
+    Heat is the right thing to key on, because heat is the only reason holding
+    is not free. A motor asked to stand still under load is dissipating that
+    load continuously -- the same run was at 40 degC holding 15.34 N.m, and the
+    morning stall reached 62 degC. So `--hold-on-fault -1`, the default, holds
+    INDEFINITELY and ends on whichever comes first:
+
+        - any joint reaches `--hold-max-temp`, which is the real limit and is
+          announced a few degrees out so it is not a surprise;
+        - the operator presses Ctrl-C, having taken the weight;
+        - nothing. It will hold all day if the arm is cool enough to.
+
+    A positive `--hold-on-fault` restores the old fixed window, and 0 releases
+    at once. Both remain honest options; neither is the default any more.
 
     The guards deliberately do NOT re-run during the hold. They just fired;
     re-running them would abort the abort handler on its first pass and release
-    instantly, which is the behaviour this exists to prevent. The motor's own
-    protection remains the backstop, and the temperature is printed so the
-    operator can see it climbing.
+    instantly, which is the behaviour this exists to prevent. Temperature is
+    the one check that does run, because it is the one condition that gets
+    worse the longer the hold succeeds.
 
-    It is still a bounded window, not a controlled descent. Lowering an
-    extended arm to the bench under power is unbuilt. Returns 1 always: this is
-    an abort path, and nothing it does makes the run a success.
+    STILL NOT A CONTROLLED DESCENT. When the temperature limit does arrive, the
+    arm goes limp wherever it is. Holding longer moves the fall rather than
+    preventing it, and lowering an extended arm to the bench under power
+    remains unbuilt. Returns 1 always: this is an abort path, and nothing it
+    does makes the run a success.
     """
     if not engaged:
         return 1
-    secs = max(0.0, getattr(args, "hold_on_fault", 0.0))
-    if secs <= 0:
+    secs = getattr(args, "hold_on_fault", -1.0)
+    if secs == 0:
         print("--hold-on-fault 0: releasing torque now.")
         return 1
 
@@ -1655,27 +1677,69 @@ def _settle_and_release(ctrl, motors, args, engaged: bool = True) -> int:
               "!! TAKE THE WEIGHT OF THE ARM.", file=sys.stderr)
         return 1
 
-    print(f"\n!! HOLDING WHERE IT IS FOR {secs:.0f} SECONDS, THEN TORQUE "
-          f"DROPS.")
-    print("!! Targets reset to measured position -- nothing is being pushed.")
-    print("!! TAKE THE WEIGHT OF THE ARM NOW, or cut the DC switch.\n")
-    end = time.monotonic() + secs
+    hot = getattr(args, "hold_max_temp", STALL_TEMP_C)
+    forever = secs < 0
+    if forever:
+        print(f"\n!! FROZEN. Holding position until {hot:.0f} degC or Ctrl-C.")
+        print("!! Targets reset to measured position -- nothing is being "
+              "pushed.")
+        print("!! Take the weight, then Ctrl-C to release. The arm will NOT "
+              "drop on a timer.")
+        print(f"!! It WILL drop if any joint reaches {hot:.0f} degC. Watch the "
+              f"temperature.\n")
+        end = float("inf")
+    else:
+        print(f"\n!! HOLDING WHERE IT IS FOR {secs:.0f} SECONDS, THEN TORQUE "
+              f"DROPS.")
+        print("!! Targets reset to measured position -- nothing is being "
+              "pushed.")
+        print("!! TAKE THE WEIGHT OF THE ARM NOW, or cut the DC switch.\n")
+        end = time.monotonic() + secs
+
     period = 1.0 / max(1.0, args.stream_hz)
-    while time.monotonic() < end:
-        step = time.monotonic()
-        _command_all(motors, args, hold)
-        s = _sample_all(ctrl, motors)
-        if sys.stdout.isatty():
+    t0 = time.monotonic()
+    near = False
+    try:
+        while time.monotonic() < end:
+            step = time.monotonic()
+            _command_all(motors, args, hold)
+            s = _sample_all(ctrl, motors)
             tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
             tp = max((s[n].get("temp", 0.0) for n in s), default=0.0)
-            sys.stdout.write(
-                f"\r\033[2Kholding, {end - time.monotonic():>4.1f} s left, "
-                f"peak torque {tq:>6.2f} N.m, {tp:>3.0f} degC")
-            sys.stdout.flush()
-        # Pace it. `_command_all` with no hold sends one pass and returns, so
-        # without this the only thing limiting the rate is however long
-        # `_sample_all` happens to take.
-        time.sleep(max(0.0, period - (time.monotonic() - step)))
+            hottest = max(s, key=lambda n: s[n].get("temp", 0.0), default="")
+
+            if tp >= hot:
+                print(f"\n\n!! {hottest} reached {tp:.0f} degC, at or past "
+                      f"--hold-max-temp {hot:.0f}.\n"
+                      f"!! Holding longer damages the motor. RELEASING "
+                      f"TORQUE -- TAKE THE WEIGHT NOW.")
+                return 1
+            # Announce the limit before it arrives. A hold that ends without
+            # warning is the 5-second countdown again, just with a different
+            # trigger -- the point of keying on heat is that heat is visible
+            # on the way up.
+            if not near and tp >= hot - 5.0:
+                near = True
+                print(f"\n\n!! {hottest} at {tp:.0f} degC, within 5 of the "
+                      f"{hot:.0f} limit. Torque drops when it gets there.\n")
+
+            if sys.stdout.isatty():
+                left = ("no limit" if forever
+                        else f"{end - time.monotonic():>4.1f} s left")
+                sys.stdout.write(
+                    f"\r\033[2Kfrozen {time.monotonic() - t0:>5.1f} s, {left}, "
+                    f"peak torque {tq:>6.2f} N.m, {tp:>3.0f}/{hot:.0f} degC")
+                sys.stdout.flush()
+            # Pace it. `_command_all` with no hold sends one pass and returns,
+            # so without this the only thing limiting the rate is however long
+            # `_sample_all` happens to take.
+            time.sleep(max(0.0, period - (time.monotonic() - step)))
+    except KeyboardInterrupt:
+        # The operator has the arm. This is the intended way out of an
+        # indefinite hold, so it is not an error and must not print a
+        # traceback over the thing they are reading.
+        print("\n\nreleased by operator.")
+        return 1
     print("\nhold expired -- releasing torque.")
     return 1
 
@@ -2065,10 +2129,14 @@ def main() -> int:
                    help="--gravity-map only: angle to walk --joint to. Must "
                         "be inside its measured travel")
     p.add_argument("--abort-deg", type=float, default=15.0)
-    p.add_argument("--hold-on-fault", type=float, default=5.0,
-                   help="seconds to hold position after an abort before "
-                        "torque is released. 0 releases immediately, which "
-                        "DROPS an extended arm")
+    p.add_argument("--hold-on-fault", type=float, default=-1.0,
+                   help="seconds to hold position after an abort. Default -1 "
+                        "holds INDEFINITELY, until --hold-max-temp or Ctrl-C. "
+                        "0 releases immediately, which DROPS an extended arm")
+    p.add_argument("--hold-max-temp", type=float, default=STALL_TEMP_C,
+                   help="degC at which an indefinite hold gives up and "
+                        "releases. Holding is not free -- a loaded joint "
+                        "standing still dissipates that load continuously")
     p.add_argument("--max-torque", type=float, default=None,
                    help="N.m ceiling, overriding BOTH the gravity-aware warn "
                         "ceiling and the hard one. Default warn is half rated "
