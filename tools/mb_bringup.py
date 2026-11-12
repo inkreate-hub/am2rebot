@@ -792,17 +792,35 @@ def move_one(args) -> int:
         if rng is not None:
             room_up = rng["max_deg"] - RANGE_MARGIN_DEG - home
             room_dn = home - (rng["min_deg"] + RANGE_MARGIN_DEG)
-            room = min(room_up, room_dn)
+            # Only the direction we actually plan to travel can block us.
+            room = {"up": room_up, "down": room_dn}.get(
+                args.direction, min(room_up, room_dn))
             if room < args.amplitude:
                 if room < 0.5:
+                    # A joint parked against a stop is the NORMAL state of this
+                    # arm's two gravity-loaded shoulders, not an error. If the
+                    # other direction is open, say so instead of just refusing
+                    # -- the advice used to be "move the arm somewhere with
+                    # room", which for a resting joint means hand-holding a
+                    # 36 N.m motor through its own test.
+                    other = ("up" if room_up > room_dn else "down")
+                    best = max(room_up, room_dn)
                     print(f"\nREFUSING: {name} is at {home:+.2f} deg with "
                           f"measured travel {rng['min_deg']:+.1f}..."
                           f"{rng['max_deg']:+.1f}.\n"
-                          f"There is {room:+.2f} deg of room inside a "
-                          f"{RANGE_MARGIN_DEG:.0f} deg margin -- it is "
-                          f"already at a stop.\nMove the arm somewhere with "
-                          f"room before energising this joint.",
-                          file=sys.stderr)
+                          f"There is {room:+.2f} deg of room {args.direction} "
+                          f"inside a {RANGE_MARGIN_DEG:.0f} deg margin -- it "
+                          f"is against a stop.", file=sys.stderr)
+                    if best >= args.amplitude and args.direction == "both":
+                        print(f"\n{best:.1f} deg IS free going {other}. Test "
+                              f"one-sided instead -- the joint lifts off the "
+                              f"stop under its own power:\n"
+                              f"    python tools/mb_bringup.py --move --joint "
+                              f"{name} --amplitude {args.amplitude:.0f} "
+                              f"--direction {other}", file=sys.stderr)
+                    else:
+                        print("Move the arm somewhere with room before "
+                              "energising this joint.", file=sys.stderr)
                     return 2
                 print(f"!! clamping amplitude {args.amplitude:.1f} -> "
                       f"{room:.1f} deg: measured travel "
@@ -810,7 +828,7 @@ def move_one(args) -> int:
                       f"home {home:+.2f}, {RANGE_MARGIN_DEG:.0f} deg margin.")
                 args.amplitude = room
 
-        plan = _plan(home, args.amplitude, args.cycles)
+        plan = _plan(home, args.amplitude, args.cycles, args.direction)
         mode_name = {MODE_MIT: "MIT (no motor-side limits!)",
                      MODE_CSP: "CSP", MODE_POS_VEL: "POS_VEL profile"}[
                          _mode_of(args)]
@@ -1116,12 +1134,26 @@ good joint and the next one.""")
         _shutdown(ctrl)
 
 
-def _plan(home: float, amplitude: float, cycles: int) -> list[float]:
-    """Out, back through home, the other way, back. Both directions matter --
-    a one-sided test cannot show backlash or an asymmetric gain."""
+def _plan(home: float, amplitude: float, cycles: int,
+          direction: str = "both") -> list[float]:
+    """Out, back through home, the other way, back.
+
+    Both directions is the better test and stays the default -- a one-sided
+    move cannot show backlash or an asymmetric gain.
+
+    But it is impossible for a joint resting against a stop, which is where
+    `shoulder_lift` and `elbow_flex` sit in this arm's natural sitting pose:
+    measured travel runs from ~0 upward, and that 0 is where gravity parks
+    them. The alternative to one-sided is hand-lifting a 36 N.m joint and
+    holding it steady while it is energised, which is worse. `--direction up`
+    lifts away from the stop under the motor's own power and returns.
+    """
     out: list[float] = []
     for _ in range(max(1, cycles)):
-        out += [home + amplitude, home, home - amplitude, home]
+        if direction != "down":
+            out += [home + amplitude, home]
+        if direction != "up":
+            out += [home - amplitude, home]
     return out
 
 
@@ -1168,6 +1200,11 @@ def main() -> int:
     p.add_argument("--joint", choices=sorted(CAN_IDS))
     p.add_argument("--amplitude", type=float, default=5.0,
                    help="degrees either side of the present position")
+    p.add_argument("--direction", choices=("both", "up", "down"),
+                   default="both",
+                   help="which way to test. 'both' is the better check and "
+                        "the default; use one-sided for a joint resting "
+                        "against a stop")
     p.add_argument("--max-step-deg", type=float, default=1.0)
     p.add_argument("--vlim-dps", type=float, default=20.0,
                    help="POS_VEL velocity limit, deg/s")
