@@ -399,17 +399,36 @@ def ranges(args) -> int:
     the arm, and the encoders report where it went. Run it, move every joint
     slowly through its full comfortable travel in both directions, Ctrl-C.
 
-        python tools/mb_bringup.py --ranges
+        python tools/mb_bringup.py --ranges                      # all seven
+        python tools/mb_bringup.py --ranges --joint elbow_flex   # just one
+
+    One at a time is the better way to do it. Sweeping all seven at once means
+    watching seven rows and hoping none was missed, and on 2026-11-12 two were
+    -- `shoulder_lift` and `elbow_flex` came out under a degree and silently
+    did not make it into the file. With `--joint` there is one number on screen
+    and it is either growing or it is not.
+
+    A `--joint` run REPLACES that joint's entry and leaves the other six alone,
+    so the file fills up across runs. A full run owns all seven.
 
     What comes out is a floor under `--move`, which afterwards refuses to plan
     a target outside measured travel.
     """
     mb, ctrl, motors = _open(args)
+    # Which joints this run is responsible for. Everything outside the scope
+    # keeps whatever the file already says about it; everything inside is
+    # rewritten from what we measure here, including being dropped if it turns
+    # out thin. A stale wide range is the dangerous direction -- it is what
+    # lets `--move` plan into a stop -- so a joint we just watched not move
+    # must not keep an old measurement saying it has room.
+    scope = [args.joint] if args.joint else list(CAN_IDS)
+    motors = {n: m for n, m in motors.items() if n in scope}
     try:
         _reporting(motors.values(), True)
         time.sleep(0.3)
-        print("TORQUE IS OFF AND STAYS OFF. Move each joint by hand, slowly, "
-              "through its full travel both ways.\nCtrl-C when done.\n")
+        what = f"'{args.joint}'" if args.joint else "each joint"
+        print(f"TORQUE IS OFF AND STAYS OFF. Move {what} by hand, slowly, "
+              f"through its full travel both ways.\nCtrl-C when done.\n")
 
         lo: dict[str, float] = {}
         hi: dict[str, float] = {}
@@ -441,7 +460,7 @@ def ranges(args) -> int:
                 samples += 1
 
                 if time.monotonic() >= next_save:
-                    _write_ranges(lo, hi)
+                    _write_ranges(lo, hi, scope)
                     next_save = time.monotonic() + 2.0
 
                 if tty:
@@ -453,9 +472,14 @@ def ranges(args) -> int:
                     # So move up N-1, return to column 0, and leave the cursor
                     # parked at the end of the last row.
                     if samples > 1:
-                        sys.stdout.write(f"\033[{len(CAN_IDS) - 1}A\r")
+                        # `\033[0A` is NOT a no-op -- ECMA-48 reads a zero
+                        # parameter as 1, so a single-joint sweep would walk
+                        # up the screen one line per pass. Emit the cursor-up
+                        # only when there is actually a row to go up to.
+                        up = f"\033[{len(scope) - 1}A" if len(scope) > 1 else ""
+                        sys.stdout.write(f"{up}\r")
                     rows = (f"\033[2K{_range_row(n, now, lo, hi)}"
-                            for n in CAN_IDS)
+                            for n in scope)
                     sys.stdout.write("\n".join(rows))
                     sys.stdout.flush()
                 elif time.monotonic() >= next_print:
@@ -463,7 +487,7 @@ def ranges(args) -> int:
                     # anything, it just interleaves. Print a plain block now
                     # and then instead of smearing one every pass.
                     print(f"[{samples} samples]")
-                    for name in CAN_IDS:
+                    for name in scope:
                         print(f"  {_range_row(name, now, lo, hi)}")
                     next_print = time.monotonic() + 5.0
         except KeyboardInterrupt:
@@ -474,32 +498,38 @@ def ranges(args) -> int:
         # through here costs nothing. That was not true before: the file used
         # to be written once, at the end, and an interrupt anywhere in this
         # block threw away the entire sweep.
-        thin = _write_ranges(lo, hi)
+        thin = _write_ranges(lo, hi, scope)
         if not lo:
             print("Nothing was recorded.", file=sys.stderr)
             return 1
 
         print(f"{'joint':<15}{'min':>9}{'max':>9}{'travel':>9}")
         print("-" * 42)
-        for name in CAN_IDS:
+        for name in scope:
             if name not in lo:
                 continue
             print(f"{name:<15}{lo[name]:>9.2f}{hi[name]:>9.2f}"
                   f"{hi[name] - lo[name]:>9.2f}")
 
-        if not RANGES_PATH.exists():
-            print("\nNOTHING WAS MEASURED -- no joint moved more than 1 deg.\n"
+        recorded = _load_ranges()
+        if not recorded:
+            print("\nNOTHING WAS MEASURED -- nothing moved more than 1 deg.\n"
                   "No file written, because a range nobody measured is worse "
                   "than no range at all.\nRun it again and move the arm.",
                   file=sys.stderr)
             return 1
 
-        recorded = len(_load_ranges())
-        print(f"\nwrote {RANGES_PATH} ({recorded}/{len(CAN_IDS)} joints)")
+        print(f"\nwrote {RANGES_PATH} "
+              f"({len(recorded)}/{len(CAN_IDS)} joints on file)")
 
         if thin:
             print(f"\n!! NOT recorded, moved under 1 deg: {', '.join(thin)}\n"
                   f"   --move will refuse these until you sweep them.")
+        missing = [n for n in CAN_IDS if n not in recorded]
+        if missing:
+            print(f"\nstill unmeasured: {', '.join(missing)}\n"
+                  f"   python tools/mb_bringup.py --ranges "
+                  f"--joint {missing[0]}")
         return 0
     finally:
         _reporting(motors.values(), False)
@@ -563,7 +593,8 @@ def _sample_all(ctrl, motors, gap: float = SAMPLE_GAP_S) -> dict[str, dict]:
     return out
 
 
-def _write_ranges(lo: dict[str, float], hi: dict[str, float]) -> list[str]:
+def _write_ranges(lo: dict[str, float], hi: dict[str, float],
+                  scope: list[str]) -> list[str]:
     """Persist travel measured so far. Returns the joints too thin to record.
 
     CALLED FROM INSIDE THE SAMPLING LOOP, not only at the end. A sweep is ten
@@ -573,11 +604,19 @@ def _write_ranges(lo: dict[str, float], hi: dict[str, float]) -> list[str]:
     it. Writing continuously means an interrupt at any instant costs at most
     the last couple of seconds.
 
+    `scope` is what this run measured. Joints outside it keep what the file
+    already says, so a one-joint sweep tops the file up instead of replacing
+    it. Joints inside it are rewritten from this run alone -- including being
+    DROPPED if they came out thin. That asymmetry is deliberate: a leftover
+    wide range on a joint we just watched sit still is exactly the input that
+    lets `--move` plan into a hard stop.
+
     Joints that moved under a degree are omitted rather than stored as a
     zero-width range -- see the comment in `ranges`.
     """
-    out, thin = {}, []
-    for name in CAN_IDS:
+    out = {n: v for n, v in _load_ranges().items() if n not in scope}
+    thin = []
+    for name in scope:
         if name not in lo:
             continue
         span = hi[name] - lo[name]
@@ -589,6 +628,7 @@ def _write_ranges(lo: dict[str, float], hi: dict[str, float]) -> list[str]:
                      "travel_deg": round(span, 2)}
     if not out:
         return thin
+    out = {n: out[n] for n in CAN_IDS if n in out}
     RANGES_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = RANGES_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(
@@ -1122,7 +1162,8 @@ def main() -> int:
     action.add_argument("--clear-faults", action="store_true",
                         help="clear latched faults on all 7; no torque")
     action.add_argument("--ranges", action="store_true",
-                        help="record travel by hand; torque stays OFF")
+                        help="record travel by hand; torque stays OFF. "
+                             "--joint records that one and keeps the rest")
 
     p.add_argument("--joint", choices=sorted(CAN_IDS))
     p.add_argument("--amplitude", type=float, default=5.0,
