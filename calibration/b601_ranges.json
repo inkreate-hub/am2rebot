@@ -1,0 +1,31 @@
+{
+  "recorded": "2026-11-12T13:34:43",
+  "note": "hand-driven, torque off. Endpoints are where the joint stopped feeling free, not the true mechanical stop.",
+  "joints": {
+    "shoulder_pan": {
+      "min_deg": -9.78,
+      "max_deg": 1.19,
+      "travel_deg": 10.96
+    },
+    "wrist_flex": {
+      "min_deg": -26.39,
+      "max_deg": 0.26,
+      "travel_deg": 26.65
+    },
+    "wrist_yaw": {
+      "min_deg": -5.89,
+      "max_deg": 88.42,
+      "travel_deg": 94.31
+    },
+    "wrist_roll": {
+      "min_deg": 10.72,
+      "max_deg": 127.95,
+      "travel_deg": 117.23
+    },
+    "gripper": {
+      "min_deg": 38.59,
+      "max_deg": 165.44,
+      "travel_deg": 126.85
+    }
+  }
+}

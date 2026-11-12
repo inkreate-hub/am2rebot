@@ -416,6 +416,8 @@ def ranges(args) -> int:
         now: dict[str, float] = {}
         samples = 0
         next_save = 0.0
+        next_print = 0.0
+        tty = sys.stdout.isatty()
 
         # SAMPLE ALL SEVEN PER PASS, not one at a time. `_poll` sleeps 50 ms
         # per motor while it waits on a request/response round trip, which for
@@ -427,24 +429,14 @@ def ranges(args) -> int:
         # costs one pass and needs no request at all.
         print(f"{'joint':<15}{'now':>9}{'min':>9}{'max':>9}{'travel':>9}")
         print("-" * 51)
-        for _ in CAN_IDS:
-            print()
+        if tty:
+            # Placeholder rows for the in-place redraw to move back up over.
+            for _ in CAN_IDS:
+                print()
 
         try:
             while True:
-                for _ in range(24):
-                    try:
-                        ctrl.poll_feedback_once()
-                    except Exception:  # noqa: BLE001
-                        break
-                for name in CAN_IDS:
-                    # get_state() raises once the link goes down, and an
-                    # unhandled throw here would escape past the Ctrl-C
-                    # handler and take the whole sweep with it.
-                    try:
-                        s = _state_dict(motors[name].get_state())
-                    except Exception:  # noqa: BLE001
-                        continue
+                for name, s in _sample_all(ctrl, motors).items():
                     if "pos_deg" not in s:
                         continue
                     p = s["pos_deg"]
@@ -457,20 +449,20 @@ def ranges(args) -> int:
                     _write_ranges(lo, hi)
                     next_save = time.monotonic() + 2.0
 
-                # Redraw in place: up N lines, rewrite each, clear to EOL.
-                sys.stdout.write(f"\033[{len(CAN_IDS)}A")
-                for name in CAN_IDS:
-                    if name in now:
-                        span = hi[name] - lo[name]
-                        mark = " <-" if span >= 2 * RANGE_MARGIN_DEG else ""
-                        sys.stdout.write(
-                            f"\033[2K{name:<15}{now[name]:>9.2f}"
-                            f"{lo[name]:>9.2f}{hi[name]:>9.2f}"
-                            f"{span:>9.2f}{mark}\n")
-                    else:
-                        sys.stdout.write(f"\033[2K{name:<15}{'no data':>9}\n")
-                sys.stdout.flush()
-                time.sleep(0.02)
+                if tty:
+                    # Redraw in place: up N lines, rewrite each, clear to EOL.
+                    sys.stdout.write(f"\033[{len(CAN_IDS)}A")
+                    for name in CAN_IDS:
+                        sys.stdout.write(f"\033[2K{_range_row(name, now, lo, hi)}\n")
+                    sys.stdout.flush()
+                elif time.monotonic() >= next_print:
+                    # Piped or captured: cursor movement does not collapse
+                    # anything, it just interleaves. Print a plain block now
+                    # and then instead of smearing one every pass.
+                    print(f"[{samples} samples]")
+                    for name in CAN_IDS:
+                        print(f"  {_range_row(name, now, lo, hi)}")
+                    next_print = time.monotonic() + 5.0
         except KeyboardInterrupt:
             print(f"\n{samples} samples.\n")
 
@@ -509,6 +501,63 @@ def ranges(args) -> int:
     finally:
         _reporting(motors.values(), False)
         _shutdown(ctrl)
+
+
+#: Pause between re-arming reporting and draining the replies. Measured over
+#: 3 s windows with the arm powered and idle -- passes/s against the fraction
+#: of those passes that returned a NEW reading:
+#:
+#:      5 ms  159 Hz  30% fresh      30 ms   32 Hz  65% fresh
+#:     10 ms   89 Hz  43% fresh      50 ms   20 Hz  80% fresh
+#:     20 ms   47 Hz  62% fresh
+#:
+#: Polling harder buys less than it looks: at 5 ms most passes re-read a frame
+#: that has not changed. 20 ms is near the peak of new samples per second at a
+#: fraction of the bus traffic -- roughly 8% load, against ~18% at 10 ms.
+SAMPLE_GAP_S = 0.02
+
+
+def _range_row(name: str, now: dict, lo: dict, hi: dict) -> str:
+    """One line of the live sweep table."""
+    if name not in now:
+        return f"{name:<15}{'no data':>9}"
+    span = hi[name] - lo[name]
+    mark = " <-" if span >= 2 * RANGE_MARGIN_DEG else ""
+    return (f"{name:<15}{now[name]:>9.2f}{lo[name]:>9.2f}"
+            f"{hi[name]:>9.2f}{span:>9.2f}{mark}")
+
+
+def _sample_all(ctrl, motors, gap: float = SAMPLE_GAP_S) -> dict[str, dict]:
+    """One fresh reading from every motor. Degrees.
+
+    Re-arms reporting first, because `robstride_set_active_report` is one-shot
+    -- see `_reporting`. Without that re-arm this returns the same frozen
+    values forever, which is how a ten-minute range sweep recorded 0.00 travel
+    on all seven joints while the arm was visibly being moved by hand.
+
+    Re-arming all seven and then draining once costs one `gap` per pass rather
+    than one per joint, which is the difference between ~29 Hz and ~3 Hz.
+    """
+    for motor in motors.values():
+        try:
+            motor.robstride_set_active_report(True)
+        except Exception:  # noqa: BLE001
+            pass
+    time.sleep(gap)
+    for _ in range(24):
+        try:
+            ctrl.poll_feedback_once()
+        except Exception:  # noqa: BLE001
+            break
+    out = {}
+    for name, motor in motors.items():
+        try:
+            s = _state_dict(motor.get_state())
+        except Exception:  # noqa: BLE001
+            continue
+        if s:
+            out[name] = s
+    return out
 
 
 def _write_ranges(lo: dict[str, float], hi: dict[str, float]) -> list[str]:
@@ -906,11 +955,26 @@ def _reporting(motors, on: bool) -> None:
     `request_feedback()` + `poll_feedback_once()` returns NOTHING on these
     motors -- verified over 10 attempts against a motor that was provably alive
     (clean ping, fault report (0,0)). `robstride_set_active_report(True)` makes
-    state arrive on the first poll. The motor streams type-0x18 frames at
-    roughly 10 Hz once it is enabled and is otherwise silent.
+    state arrive on the first poll.
 
     So a scan that only requests feedback reports a healthy arm as silent. That
     is a false abort on the most dangerous possible signal.
+
+    !! IT IS ONE-SHOT. The note here used to say the motor "streams type-0x18
+    frames at roughly 10 Hz once it is enabled". It does not. Measured
+    2026-11-12, arm powered and answering 7/7: arm reporting once, then poll
+    as hard as you like for six seconds -- 120 passes, every joint returns
+    exactly ONE distinct (position, velocity) pair. Not stale by a few frames:
+    frozen, velocity noise included. Re-arm on every pass and the same loop
+    returns 62-77 distinct readings out of 78.
+
+    Nothing caught this because nothing repeated a read. `scan` reads each
+    motor once. `move_one` looks like it polls in a loop, but it is also
+    streaming position commands, and those elicit their own state frames -- so
+    it gets fresh data for a reason unrelated to this call.
+
+    Any caller that reads the same motor twice must re-arm between reads. See
+    `_sample_all`.
     """
     for motor in motors:
         try:
