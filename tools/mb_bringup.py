@@ -342,7 +342,9 @@ def zero(args) -> int:
 def move_one(args) -> int:
     """First torque. One joint, bounded steps, velocity-limited by the motor."""
     name = args.joint
-    if name in SHOULDER_JOINTS:
+    # Not on a dry run: it enables nothing, and a confirmation prompt in front
+    # of the one mode that is safe teaches people to type through the prompt.
+    if name in SHOULDER_JOINTS and not args.dry_run:
         print(f"!! {name} is a shoulder joint: RS06, 36 N.m, and it carries "
               f"the arm's weight.\n"
               f"   Do a wrist joint first. Support the arm so nothing falls "
@@ -373,8 +375,14 @@ def move_one(args) -> int:
               f"mode {mode_name}")
         print(f"home {home:+.2f} deg, plan: "
               + " -> ".join(f"{p:+.1f}" for p in plan))
+        # kp/kd reach the wire only through `send_mit`. Printing them in a
+        # profile-position run invites tuning a gain that is not in the loop --
+        # there the motor runs its own, under the vlim/acc ceiling below.
+        gains = (f"kp {args.kp}, kd {args.kd}, " if args.mit
+                 else "gains: motor-internal, ")
         print(f"steps <= {args.max_step_deg} deg, vlim {args.vlim_dps} dps, "
-              f"kp {args.kp}, abort at {args.abort_deg} deg error")
+              f"acc {args.acc_dpss} dps^2, {gains}"
+              f"abort at {args.abort_deg} deg error")
 
         if args.dry_run:
             print("\n--dry-run: nothing was enabled.")
