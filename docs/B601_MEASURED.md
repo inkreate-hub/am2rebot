@@ -168,6 +168,81 @@ only ever costs a refusal, a wide wrong one costs hardware. Note that the
 `note:` field in the JSON cannot carry this warning: `_write_ranges`
 regenerates it from a constant on every sweep.
 
+## Record and replay — 2026-11-12
+
+`traj_20261112_141427.json`, 228 frames over 11.4 s, hand-moved then played
+back through all six joints at once. **It ran clean — no guard abort, no stall,
+nothing fell.** Per-frame tracking numbers were not captured off the terminal,
+so treat this as a pass, not as a measurement.
+
+Two things it establishes that nothing before it did: six joints can be driven
+simultaneously off the LRS-600-48 without tripping it, and the measured travel
+in `b601_ranges.json` is good enough to clamp a real path against.
+
+The clamping it reported is benign and will recur. `shoulder_lift` rests at
+0.51° against a measured min of −0.35°, so the 3° endpoint margin lifts it to
+2.65° — 144 frames "clamped" is the *rest pose* touching the bottom margin, not
+the 73° peak, which sits well inside 209° of travel.
+
+## Teleop — two blockers found before anything moved, 2026-11-12
+
+Both were found by reading, not by driving the arm into them.
+
+### 1. lerobot's B601 follower is the wrong motor driver
+
+`RebotB601Follower.connect` calls `bus.add_damiao_motor(...)` with a
+`MOTOR_MODELS` table of Damiao part numbers — `4340P` shoulders, `4310` wrists.
+This arm is RobStride: it needs `add_robstride_motor` and `rs-06` / `rs-00`.
+
+`teleop_am_to_b601.py` is built on that follower, so **it cannot drive this
+arm at all.** Not a tuning problem, a driver problem. The RS capability lives
+one layer down in motorbridge, which is what `mb_bringup.py` has been using all
+along.
+
+### 2. `am2rebot_mapping.py`'s limits are sign-flipped on both shoulders
+
+| joint | `B601_LIMITS` | measured here |
+|---|---|---|
+| `shoulder_lift` | −200 .. 1 | **−0.35 .. +208.79** |
+| `elbow_flex` | −200 .. 1 | **−0.18 .. +241.79** |
+
+Same span, opposite sign. Those limits are lerobot's
+`RebotB601FollowerConfig.joint_limits`, which describe the **DM** arm; this is
+the RS arm, zeroed against a different pose. Fed the leader's mid-pose, that
+table asks for roughly −100° on both shoulders — into the stop they already
+rest on, for every frame of the session.
+
+`tools/mb_teleop.py` reads `calibration/b601_ranges.json` instead.
+
+### Alignment must be by pose, not by centre
+
+The textbook fit maps mid-leader-travel to mid-follower-travel. On this arm the
+centres are `shoulder_lift` +104° and `elbow_flex` +121°, because it parks at
+the bottom of its range. Measured against the arm's actual parked pose:
+
+| alignment | move required just to engage |
+|---|---|
+| centre | pan 72.8°, **lift 103.2°, elbow 121.3°** |
+| pose | pan 0.00°, lift 2.14°, elbow 3.02° |
+
+So `--align pose` is the default: offsets are computed at engage time from
+where both arms are standing, and the first commanded target equals the
+follower's current position. The 2.14/3.02 are the 3° endpoint margin lifting
+the two parked shoulders off their stop — the same effect replay shows.
+
+**The cost is that the start pose fixes the reachable range.** Engaging from
+the parked pose clips 51% of the leader's travel on `shoulder_lift` and 52% on
+`elbow_flex`, because the whole lower half of the leader's swing maps below the
+follower's floor. Park the arm half-raised and match the leader to it to get
+travel in both directions.
+
+### Directions are still unverified on hardware
+
+`DEFAULT_DIRECTIONS` in `ah/mapping.py` was established by driving the **sim**
+from the live leader. The physical arm has since been re-zeroed and measured.
+A sign that was right in the model is not thereby right here — verify one joint
+at a time with `--joints`, flip with `--invert`.
+
 ## Diagnostics that lie
 
 **An ERROR-PASSIVE link reports a healthy bus as dead.** A scan returned 0/7

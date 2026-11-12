@@ -1,6 +1,27 @@
 #!/usr/bin/env python
 """Map AM-ARM200 leader joint angles onto reBot B601 follower joint angles.
 
+⚠️ SUPERSEDED FOR THE PHYSICAL ARM — USE `tools/mb_teleop.py`. ⚠️
+
+`B601_LIMITS` below is lerobot's `RebotB601FollowerConfig.joint_limits`, which
+describes the **DM** arm. Ivan's is the **RS** arm, and once it was zeroed and
+measured by hand on 2026-11-12 the two shoulders came out the other way round:
+
+    joint           this table      measured on the real RS arm
+    shoulder_lift   -200 ..   1     -0.35 .. +208.79
+    elbow_flex      -200 ..   1     -0.18 .. +241.79
+
+Same travel, opposite sign. Run the leader through this table and its mid-pose
+lands near -100 deg on both shoulders, so every frame of a teleop session
+commands two 36 N.m joints into the stop they are already parked against — the
+stop that read 58.7 N.m on the morning of 2026-11-12.
+
+`tools/mb_teleop.py` reads `calibration/b601_ranges.json` instead, the same
+measured file `mb_bringup.py --move` and `--replay` already refuse to run
+without. It also drives through motorbridge's `add_robstride_motor`, where
+`teleop_am_to_b601.py` goes via lerobot's `RebotB601Follower` and its hard-coded
+`add_damiao_motor`. This file is kept for the sim path and for its provenance.
+
 Both arms use the same joint names and both speak degrees, so LeRobot will
 happily connect them — but the numbers do not line up, for two separate reasons:
 
@@ -37,6 +58,9 @@ from dataclasses import dataclass, field
 # B601 follower joint limits, degrees.
 # Source: RebotB601FollowerConfig.joint_limits. The follower clips to these
 # itself; we clip too so the preview tells the truth about what it will do.
+#
+# ⚠️ DM-variant limits. Sign-flipped on both shoulders against the measured RS
+# arm — see the module docstring. Do not drive the physical arm through these.
 B601_LIMITS: dict[str, tuple[float, float]] = {
     "shoulder_pan": (-150.0, 150.0),
     "shoulder_lift": (-200.0, 1.0),
