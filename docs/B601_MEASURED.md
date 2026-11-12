@@ -243,6 +243,89 @@ from the live leader. The physical arm has since been re-zeroed and measured.
 A sign that was right in the model is not thereby right here — verify one joint
 at a time with `--joints`, flip with `--invert`.
 
+**Resolved 2026-11-12 evening.** All six were verified by hand, one at a time,
+and are recorded in `calibration/teleop_directions.json`. Four of the six
+needed the sign the sim gave; two did not. The signs that stuck:
+
+| joint | direction | | joint | direction |
+|---|---|---|---|---|
+| `shoulder_pan` | `+1` | | `wrist_flex` | `−1` |
+| `shoulder_lift` | `+1` | | `wrist_yaw` | `−1` |
+| `elbow_flex` | `−1` | | `wrist_roll` | `+1` |
+
+## The guard's torque ceiling was below the arm's own weight — 2026-11-12
+
+**`shoulder_lift` aborted a teleop run at 18.28 N·m while it was not being
+driven.** It was in the held set, target unchanged, tracking error `+0.00`. The
+operator had extended `elbow_flex` to 143.7°, which swung the forearm and wrist
+mass out from the base and raised the shoulder's gravity moment until standing
+still cost 18.28 N·m against a ceiling of 18.0. It tripped by **0.28 N·m, 1.5%
+over**. Nothing was obstructed.
+
+The abort message said *"it is driving into something — a stop, the bench, or
+another link"*. All three were false. The arm was holding itself up.
+
+Then the abort returned into the `finally`, which disabled all six motors at
+once, and the extended arm fell. `elbow_flex` went 143.7° → −0.11°.
+
+### Two lessons, and they are independent
+
+**A torque ceiling set from the datasheet is not a measurement.** `rated × 0.5`
+was chosen for a bounded few-degree bring-up move on an unloaded arm. Teleop
+breaks that premise: the payload is the arm's own outstretched mass. Real
+numbers from that run — `elbow_flex` peaked at **17.78 N·m**, 0.22 from its own
+trip. Both shoulders were effectively at the limit just existing in that pose.
+
+**A stall and a gravity hold are identical on the torque channel.** They differ
+everywhere else, and this is the whole basis of the current guard:
+
+| signal | stall (morning, 58.7 N·m) | gravity hold (evening, 18.28 N·m) |
+|---|---|---|
+| torque | high and rising | high and steady |
+| tracking error | 5.3° and growing | 0.00° |
+| velocity | ~0 against a command | tracking normally |
+
+There are now three ceilings per joint. `stall` is half of rated and **fixed** —
+crossing it with a large error and no motion aborts. `warn` is raised by
+`--gravity-map` measurements and only suppresses a notice. `hard` is 85% of
+rated and aborts unconditionally. The stall threshold is deliberately not raised
+by the gravity map: a gravity load appears with *zero* error by definition, so
+knowing what the arm can hold says nothing about what is acceptable while
+failing to reach a target. An earlier draft collapsed the two and left a mapped
+shoulder blind to a real stall between 18 and 26 N·m.
+
+### Aborting by cutting torque is worse than the condition
+
+On a folded arm, releasing is harmless. At 143° of extension it converts a
+warning into a fall. Every abort path now goes through `_settle_and_release`,
+which **re-targets every joint to its measured position first** — that removes a
+stall's commanded error, and with it the stall, without removing the torque that
+holds the arm up — then streams that for `--hold-on-fault` seconds before
+releasing.
+
+Guards do not re-run during that hold. They have just fired; re-running them
+would abort the abort handler on its first pass and release instantly, which is
+the exact behaviour it exists to prevent.
+
+**It is still a bounded window, not a controlled descent.** Lowering an extended
+arm to the bench under power remains unbuilt.
+
+### Measure the envelope instead of arguing about it
+
+```bash
+python tools/mb_bringup.py --gravity-map --joint elbow_flex --to-deg 150
+```
+
+Walks one joint in `--max-step-deg` increments, dwells `--settle` at each, and
+records peak |torque| on **all seven** — because the joint being moved is
+usually not the one that ends up loaded. Writes
+`calibration/gravity_torque.json`, keeping the highest peak seen per joint
+across runs: one sweep visits one family of poses, and a ceiling that drops when
+you measure more is worse than no ceiling.
+
+Not yet run on this arm. Until it is, the ceilings are still the datasheet
+guess — only now the guess no longer aborts on gravity alone.
+
 ## Diagnostics that lie
 
 **An ERROR-PASSIVE link reports a healthy bus as dead.** A scan returned 0/7
