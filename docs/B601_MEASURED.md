@@ -498,3 +498,38 @@ and none of it said so. Preflight now computes `room down` / `room up` per joint
 and warns when one side is under `CORNERED_DEG` (5°) while the other is not. It
 warns rather than blocks: a joint parked on its limit is not an error, it is
 where the arm happens to be standing.
+
+## `--zero` retires the ranges file, not the gravity model — 2026-11-13
+
+A session after a power cycle kept reporting `elbow_flex` parked on its limit
+(`room down` 0.0–3.0°) across several teleop runs, then stalling into it —
+torque present, position frozen, the signature of driving into an obstruction.
+Moving the joint by hand through the same travel found nothing: no binding, no
+snag, free motion both ways. The arm itself was fine.
+
+`set_zero_position()` is RAM-only (see the note above `clear_faults`); the zero
+had not been re-established after the power cycle, so every reported angle was
+offset from the frame `calibration/b601_ranges.json` was measured in. Re-zeroed
+from the sit-down pose, re-swept `--ranges` — `elbow_flex` came back
+`-0.2 .. 198.22`, no longer cornered.
+
+`--zero` already retires `b601_ranges.json` to a `.stale-*.json` file for
+exactly this reason (see Calibration, above). It does **not** do the same for
+`calibration/gravity_model.json` or `gravity_samples.jsonl`, even though both
+are keyed to joint angles in the same old frame. The very next session logged
+fresh post-zero samples onto the existing append-only file, silently mixing two
+different zero conventions in one `gravity_samples.jsonl`.
+
+The symptom this produces downstream: with the stale model still in play (or a
+model refit on the mixed file), a genuinely heavy extended pose — `shoulder_lift`
+holding -15 to -26 N·m while being actively driven, position and velocity both
+swinging, nothing stuck — can trip the **fixed-ceiling fallback** the moment
+torque, tracking error, and velocity all cross their thresholds on the same
+frame by coincidence of the oscillation. That is not a new failure mode; it is
+the exact blind spot `## No payload, just extended` above exists to fix. It
+only reappears when `--no-gravity-model` is forced because the fitted model
+cannot be trusted.
+
+Not automated yet. Until it is: after any `--zero`, manually clear
+`gravity_model.json` and `gravity_samples.jsonl` before trusting `--fit-gravity`
+again.

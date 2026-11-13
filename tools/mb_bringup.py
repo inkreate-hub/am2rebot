@@ -639,6 +639,112 @@ def _sample_all(ctrl, motors, gap: float = SAMPLE_GAP_S) -> dict[str, dict]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Flight recorder
+#
+# WHY -- the arm has fallen three times and each diagnosis was reconstructed
+# afterwards from whatever happened to be on screen. That worked because the
+# causes were in the software and the software was printing. It will not work
+# for the remaining ones, which are electrical and silent: a PSU hiccup, a
+# motor's own protection latching, a rail dip. Those drop torque on the way
+# down and leave nothing behind.
+#
+# So every frame is written: what the leader asked for, what was commanded,
+# and what all seven motors reported back -- position, velocity, torque,
+# temperature and the STATUS WORD, which is the one channel that distinguishes
+# "we gave up" from "the motor gave up".
+#
+# It records through the freeze as well. That is deliberate and it is the whole
+# point: the last fall happened at the END of a hold, so a recorder that stops
+# at the abort would capture everything except the event.
+#
+# CSV rather than JSONL because the postmortem reads columns, and a column of
+# torques across seven joints is the shape of the question being asked. ~45
+# columns at 20 Hz is about 2 MB an hour.
+# --------------------------------------------------------------------------
+
+#: Per-joint columns, in order. `st` is the status word.
+REC_FIELDS = ("lead", "tgt", "pos", "vel", "tq", "tmp", "st")
+
+
+class FlightRecorder:
+    """Append-only per-frame log. Never raises into the control loop."""
+
+    def __init__(self, path: Path, joints: list[str]) -> None:
+        self.path = path
+        self.joints = joints
+        self.frame = 0
+        self.t0 = time.monotonic()
+        self._pending: list[str] = []
+        self.fh = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.fh = path.open("w")
+            cols = ["t", "frame", "event"]
+            for j in joints:
+                cols += [f"{j}_{f}" for f in REC_FIELDS]
+            self.fh.write(",".join(cols) + "\n")
+        except OSError:
+            self.fh = None
+
+    def event(self, tag: str) -> None:
+        """Tag the NEXT frame. Several tags in one frame are joined by ';'.
+
+        Tagging the next frame rather than writing a row of its own keeps one
+        row per control pass, so the postmortem can index by frame without
+        worrying about which rows carry motor data.
+        """
+        self._pending.append(tag.replace(",", ";"))
+
+    def write(self, sampled: dict, targets: dict, leader: dict) -> None:
+        if self.fh is None:
+            return
+        row = [f"{time.monotonic() - self.t0:.3f}", str(self.frame),
+               ";".join(self._pending)]
+        self._pending.clear()
+        for j in self.joints:
+            st = sampled.get(j) or {}
+            row += [
+                _fmt(leader.get(j)), _fmt(targets.get(j)),
+                _fmt(st.get("pos_deg")), _fmt(st.get("vel_dps")),
+                _fmt(st.get("torque")), _fmt(st.get("temp")),
+                # Blank, not 0: a motor that did not answer is a different
+                # fact from a motor reporting status 0, and conflating them
+                # is exactly how a dropped joint hides in a log.
+                "" if st.get("status") is None else f"{int(st['status'])}",
+            ]
+        self.frame += 1
+        try:
+            self.fh.write(",".join(row) + "\n")
+        except (OSError, ValueError):
+            pass
+
+    def close(self) -> None:
+        if self.fh is not None:
+            try:
+                self.fh.flush()
+                self.fh.close()
+            except OSError:
+                pass
+            self.fh = None
+
+
+def _fmt(v) -> str:
+    return "" if v is None or not math.isfinite(float(v)) else f"{float(v):.3f}"
+
+
+#: The live recorder, if any. A module global because `_settle_and_release`
+#: lives here and the teleop loop lives in mb_teleop, and both have to write to
+#: the same file. Passing it through every signature would mean touching every
+#: call site to carry something that is unambiguously one-per-process.
+REC: FlightRecorder | None = None
+
+
+def _rec_event(tag: str) -> None:
+    if REC is not None:
+        REC.event(tag)
+
+
 def _write_ranges(lo: dict[str, float], hi: dict[str, float],
                   scope: list[str]) -> list[str]:
     """Persist travel measured so far. Returns the joints too thin to record.
@@ -1098,6 +1204,13 @@ def zero(args) -> int:
                   f"measured in.\n   Retired it to {stale.name} -- re-run "
                   f"--ranges before --move.")
 
+        # NOT RETIRED HERE, AND IT SHOULD BE -- 2026-11-13. GRAVITY_MODEL_PATH
+        # and GRAVITY_SAMPLES_PATH are pose-keyed exactly like RANGES_PATH
+        # above, but nothing moves them aside. A session run after this zero
+        # appends fresh samples onto old ones measured in the retired frame,
+        # and `--fit-gravity` cannot tell the difference -- it fits one model
+        # out of two arms' worth of angles for the same real pose. Clear both
+        # files by hand after re-zeroing until this is automated the same way.
         print("\nRe-run --scan: every joint should now read within a degree "
               "of 0.")
         return 0
@@ -1967,6 +2080,7 @@ def _guard(ctrl, motors, args, targets: dict[str, float],
         resid = (tq - exp) if modelled else 0.0
 
         if math.isfinite(tq) and abs(tq) > hard_nm:
+            _rec_event(f"abort:{name}:hard:{tq:+.2f}")
             print(f"\n\nABORT: {name} at {tq:+.2f} N.m is past the hard "
                   f"ceiling {hard_nm:.1f} ({model}, rated {rated:.0f}).\n"
                   f"That is {abs(tq) / rated * 100:.0f}% of rated continuous. "
@@ -1994,6 +2108,7 @@ def _guard(ctrl, motors, args, targets: dict[str, float],
             detail = (f"{tq:+.2f} N.m where this pose explains {exp:+.2f} "
                       f"-- {resid:+.2f} unaccounted for" if modelled
                       else f"{tq:+.2f} N.m")
+            _rec_event(f"abort:{name}:stall:{tq:+.2f}:err{err:.2f}")
             print(f"\n\nABORT: {name} is STALLED -- {detail},\n"
                   f"{err:.2f} deg from target, moving {vel:+.1f} deg/s.\n"
                   f"Torque the pose does not explain, not getting there, "
@@ -2024,10 +2139,12 @@ def _guard(ctrl, motors, args, targets: dict[str, float],
                       f"it with a pose-aware one.\n")
 
         if math.isfinite(tp) and tp > args.max_temp:
+            _rec_event(f"abort:{name}:temp:{tp:.0f}")
             print(f"\n\nABORT: {name} at {tp:.0f} degC exceeds --max-temp "
                   f"{args.max_temp:.0f}. Let it cool.")
             return 1
         if math.isfinite(pos) and err > args.abort_deg:
+            _rec_event(f"abort:{name}:track:{pos - targets[name]:+.2f}")
             print(f"\n\nABORT: {name} is {pos - targets[name]:+.2f} deg from "
                   f"target, past --abort-deg {args.abort_deg:.0f}.\n"
                   f"Either it is obstructed, or the 48 V rail dropped and it "
@@ -2103,12 +2220,14 @@ def _settle_and_release(ctrl, motors, args, engaged: bool = True) -> int:
         # No positions means no safe target to stream. Holding the LAST
         # commanded target instead would be a guess about an arm we have just
         # lost sight of, and guessing is how a joint gets driven into a stop.
+        _rec_event("release:blind")
         print("\n!! could not read any position -- releasing torque NOW.\n"
               "!! TAKE THE WEIGHT OF THE ARM.", file=sys.stderr)
         return 1
 
     hot = getattr(args, "hold_max_temp", STALL_TEMP_C)
     forever = secs < 0
+    _rec_event("freeze:forever" if forever else f"freeze:{secs:.0f}s")
     if forever:
         print(f"\n!! FROZEN. Holding position until {hot:.0f} degC or Ctrl-C.")
         print("!! Targets reset to measured position -- nothing is being "
@@ -2134,11 +2253,17 @@ def _settle_and_release(ctrl, motors, args, engaged: bool = True) -> int:
             step = time.monotonic()
             _command_all(motors, args, hold)
             s = _sample_all(ctrl, motors)
+            # Recorded INSIDE the hold, every pass. The last fall happened at
+            # the end of a hold, so a log that stopped at the abort would
+            # contain everything except the event.
+            if REC is not None:
+                REC.write(s, hold, {})
             tq = max((abs(s[n].get("torque", 0.0)) for n in s), default=0.0)
             tp = max((s[n].get("temp", 0.0) for n in s), default=0.0)
             hottest = max(s, key=lambda n: s[n].get("temp", 0.0), default="")
 
             if tp >= hot:
+                _rec_event(f"release:temp:{hottest}:{tp:.0f}")
                 print(f"\n\n!! {hottest} reached {tp:.0f} degC, at or past "
                       f"--hold-max-temp {hot:.0f}.\n"
                       f"!! Holding longer damages the motor. RELEASING "
@@ -2168,8 +2293,10 @@ def _settle_and_release(ctrl, motors, args, engaged: bool = True) -> int:
         # The operator has the arm. This is the intended way out of an
         # indefinite hold, so it is not an error and must not print a
         # traceback over the thing they are reading.
+        _rec_event("release:operator")
         print("\n\nreleased by operator.")
         return 1
+    _rec_event("release:expired")
     print("\nhold expired -- releasing torque.")
     return 1
 

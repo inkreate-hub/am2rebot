@@ -1,36 +1,36 @@
 {
-  "recorded": "2026-11-12T13:48:34",
+  "recorded": "2026-11-13T16:22:12",
   "note": "hand-driven, torque off. Endpoints are where the joint stopped feeling free, not the true mechanical stop.",
   "joints": {
     "shoulder_pan": {
-      "min_deg": -61.26,
-      "max_deg": 209.6,
-      "travel_deg": 270.87
+      "min_deg": -61.94,
+      "max_deg": 170.47,
+      "travel_deg": 232.41
     },
     "shoulder_lift": {
-      "min_deg": -0.35,
-      "max_deg": 208.79,
-      "travel_deg": 209.14
+      "min_deg": -0.2,
+      "max_deg": 208.97,
+      "travel_deg": 209.16
     },
     "elbow_flex": {
-      "min_deg": -0.18,
-      "max_deg": 241.79,
-      "travel_deg": 241.97
+      "min_deg": -1.01,
+      "max_deg": 242.5,
+      "travel_deg": 243.51
     },
     "wrist_flex": {
-      "min_deg": -97.21,
-      "max_deg": 45.44,
-      "travel_deg": 142.65
+      "min_deg": -107.54,
+      "max_deg": 93.04,
+      "travel_deg": 200.57
     },
     "wrist_yaw": {
-      "min_deg": -116.66,
-      "max_deg": 97.17,
-      "travel_deg": 213.82
+      "min_deg": -118.15,
+      "max_deg": 101.65,
+      "travel_deg": 219.8
     },
     "wrist_roll": {
-      "min_deg": -139.66,
-      "max_deg": 300.29,
-      "travel_deg": 439.95
+      "min_deg": -99.52,
+      "max_deg": 90.16,
+      "travel_deg": 189.67
     }
   }
 }

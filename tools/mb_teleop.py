@@ -630,6 +630,22 @@ def _freeze(ctrl, motors, args, hold: dict[str, float]) -> int:
     return mb._settle_and_release(ctrl, motors, args, engaged=True)
 
 
+def _close_recorder() -> None:
+    """Flush and close the flight recorder, wherever `_live_loop` exits from.
+
+    Every fault path used to `return _freeze(...)` straight out of the
+    function, skipping the close-and-report code at the bottom -- exactly the
+    runs a postmortem would need, left unflushed and never pointed at.
+    """
+    if mb.REC is not None:
+        p = mb.REC.path
+        frames = mb.REC.frame
+        mb.REC.close()
+        mb.REC = None
+        print(f"\n{frames} frames recorded to {p}")
+        print(f"  mb_postmortem.py {p}   (reads the log, touches nothing)")
+
+
 def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
                hold: dict[str, float]) -> int:
     """The control loop. Every target is rate-limited, clamped, then guarded."""
@@ -662,6 +678,16 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
     # what they cost. Opening this append is the entire cost;
     # `_log_gravity_sample` decides per frame whether the frame is usable and
     # is written so it cannot raise into the control loop.
+    lead_raw: dict[str, float] = {}
+    # The flight recorder covers ALL SEVEN joints, not just the six being
+    # driven. A joint nobody is commanding is exactly where a rail dip or a
+    # motor's own protection shows up first, uncontaminated by anything we did.
+    if not args.no_log:
+        path = (Path(args.log) if args.log else
+                mb.TRAJ_DIR / f"teleop_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        mb.REC = mb.FlightRecorder(path, list(mb.CAN_IDS))
+        mb._rec_event("start:" + ",".join(names))
+        print(f"recording every frame to {path}")
     gfh = None
     if not args.no_gravity_log:
         try:
@@ -688,10 +714,19 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
                 # So freeze: keep streaming the target the arm is already at,
                 # under the same guards, and give the operator time to take
                 # the weight.
+                mb._rec_event(f"leader_lost:{type(exc).__name__}")
                 print(f"\n\nLEADER STOPPED ANSWERING: {exc}")
                 print(_leader_lost_advice(args))
-                return _freeze(ctrl, motors, args, hold)
+                rc = _freeze(ctrl, motors, args, hold)
+                _close_recorder()
+                return rc
+            lead_raw = {}
             for n in names:
+                # The RAW leader angle, before scale, sign, offset and clamp.
+                # Logged unprocessed on purpose: if the follower ends up
+                # somewhere surprising, the first question is whether the
+                # leader asked for it, and a mapped number cannot answer that.
+                lead_raw[n] = action[f"{n}.pos"]
                 want = maps[n].apply(action[f"{n}.pos"])
                 if abs(maps[n].raw(action[f"{n}.pos"]) - want) > 1e-6:
                     clamped += 1
@@ -703,6 +738,8 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
             mb._command_all(motors, args, hold)
 
             s = mb._sample_all(ctrl, motors)
+            if mb.REC is not None:
+                mb.REC.write(s, hold, lead_raw)
             mb._log_gravity_sample(gfh, s, hold)
             err = max((abs(s[n]["pos_deg"] - hold[n])
                        for n in hold if "pos_deg" in s.get(n, {})), default=0.0)
@@ -722,7 +759,9 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
                 # 2026-11-12 that turned a 0.28 N.m overshoot on a joint that
                 # was not even being driven into a fall from 143 deg. Stop
                 # pushing, hold, announce, then release.
-                return _freeze(ctrl, motors, args, hold)
+                rc = _freeze(ctrl, motors, args, hold)
+                _close_recorder()
+                return rc
             i += 1
             # Fixed cadence against a running deadline, not `sleep(period)`:
             # `_sample_all` alone costs ~21 ms, so sleeping a full period on
@@ -738,6 +777,7 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
                 time.sleep(due - now)
     except KeyboardInterrupt:
         stopped = True
+        mb._rec_event("stop:operator")
     finally:
         if gfh is not None:
             gfh.close()
@@ -766,6 +806,10 @@ def _live_loop(leader, ctrl, motors, maps: dict[str, JointMap], args,
                  f", {mb.MIN_FIT_SAMPLES} needed to fit.")
               + "\n  mb_bringup.py --fit-gravity   "
                 "(reads the log, moves nothing)")
+    # Closed here rather than in the `finally` above: the freeze on the
+    # Ctrl-C path runs AFTER that finally, and the freeze is the part of the
+    # log worth having.
+    _close_recorder()
     return 0
 
 
@@ -829,6 +873,12 @@ def main() -> int:
                         "gravity_model.json exists")
     p.add_argument("--no-gravity-log", action="store_true",
                    help="do not append pose/torque samples for --fit-gravity")
+    p.add_argument("--log", metavar="FILE", default=None,
+                   help="per-frame flight recorder path. Default is an "
+                        "auto-named CSV under recordings/")
+    p.add_argument("--no-log", action="store_true",
+                   help="do not record frames. You lose the only evidence of "
+                        "an electrical drop, so prefer leaving it on")
     p.add_argument("--mode-timeout-ms", type=int, default=1000)
     p.add_argument("--retries", type=int, default=5)
     p.add_argument("--kp", type=float, default=8.0)
